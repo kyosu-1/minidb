@@ -1,0 +1,375 @@
+// Package engine provides the main database engine.
+package engine
+
+import (
+	"fmt"
+	"minidb/internal/index"
+	"minidb/internal/sql"
+	"minidb/internal/storage"
+	"minidb/internal/txn"
+	"minidb/internal/wal"
+	"minidb/pkg/types"
+	"os"
+	"path/filepath"
+)
+
+// Engine represents the database engine.
+type Engine struct {
+	dataDir     string
+	walWriter   *wal.Writer
+	diskManager *storage.DiskManager
+	bufferPool  *storage.BufferPool
+	catalog     *storage.Catalog
+	txnManager  *txn.Manager
+	mvccStore   *txn.MVCCStore
+	executor    *sql.Executor
+	indexes     map[uint32]*index.BTree // tableID -> index
+}
+
+// Config holds engine configuration.
+type Config struct {
+	DataDir        string
+	BufferPoolSize int
+}
+
+const (
+	defaultBufferPoolSize = 1024 // 1024 pages = 4MB
+	metaFileName          = "minidb.meta"
+)
+
+// New creates a new database engine.
+func New(cfg Config) (*Engine, error) {
+	if cfg.BufferPoolSize == 0 {
+		cfg.BufferPoolSize = defaultBufferPoolSize
+	}
+
+	// Create data directory if needed
+	if err := os.MkdirAll(cfg.DataDir, 0755); err != nil {
+		return nil, fmt.Errorf("failed to create data directory: %w", err)
+	}
+
+	walPath := filepath.Join(cfg.DataDir, "wal.log")
+	dataPath := filepath.Join(cfg.DataDir, "data.db")
+	metaPath := filepath.Join(cfg.DataDir, metaFileName)
+
+	// Initialize WAL writer
+	walWriter, err := wal.NewWriter(walPath)
+	if err != nil {
+		return nil, fmt.Errorf("failed to create WAL writer: %w", err)
+	}
+
+	// Initialize disk manager
+	diskManager, err := storage.NewDiskManager(dataPath)
+	if err != nil {
+		walWriter.Close()
+		return nil, fmt.Errorf("failed to create disk manager: %w", err)
+	}
+
+	// Initialize buffer pool
+	bufferPool := storage.NewBufferPool(diskManager, cfg.BufferPoolSize)
+
+	// Initialize or load catalog
+	var catalog *storage.Catalog
+	if _, err := os.Stat(metaPath); os.IsNotExist(err) {
+		// New database
+		catalog, err = storage.NewCatalog(bufferPool)
+		if err != nil {
+			diskManager.Close()
+			walWriter.Close()
+			return nil, fmt.Errorf("failed to create catalog: %w", err)
+		}
+		// Save meta
+		if err := saveMeta(metaPath, catalog.GetCatalogPageID()); err != nil {
+			diskManager.Close()
+			walWriter.Close()
+			return nil, err
+		}
+	} else {
+		// Load existing database
+		catalogPageID, err := loadMeta(metaPath)
+		if err != nil {
+			diskManager.Close()
+			walWriter.Close()
+			return nil, err
+		}
+		catalog, err = storage.LoadCatalog(bufferPool, catalogPageID)
+		if err != nil {
+			diskManager.Close()
+			walWriter.Close()
+			return nil, fmt.Errorf("failed to load catalog: %w", err)
+		}
+	}
+
+	// Initialize MVCC store (still used for version tracking)
+	mvccStore := txn.NewMVCCStore()
+	txnManager := txn.NewManager(walWriter)
+
+	// Create executor
+	executor := sql.NewExecutor(mvccStore, txnManager, walWriter)
+	executor.SetStorage(catalog, bufferPool)
+
+	e := &Engine{
+		dataDir:     cfg.DataDir,
+		walWriter:   walWriter,
+		diskManager: diskManager,
+		bufferPool:  bufferPool,
+		catalog:     catalog,
+		txnManager:  txnManager,
+		mvccStore:   mvccStore,
+		executor:    executor,
+		indexes:     make(map[uint32]*index.BTree),
+	}
+
+	// Load existing indexes
+	e.loadIndexes()
+
+	// Perform recovery if needed
+	if err := e.recover(); err != nil {
+		e.Close()
+		return nil, fmt.Errorf("recovery failed: %w", err)
+	}
+
+	return e, nil
+}
+
+func saveMeta(path string, catalogPageID types.PageID) error {
+	f, err := os.Create(path)
+	if err != nil {
+		return err
+	}
+	defer f.Close()
+	_, err = fmt.Fprintf(f, "%d\n", catalogPageID)
+	return err
+}
+
+func loadMeta(path string) (types.PageID, error) {
+	f, err := os.Open(path)
+	if err != nil {
+		return 0, err
+	}
+	defer f.Close()
+	var pageID types.PageID
+	_, err = fmt.Fscanf(f, "%d\n", &pageID)
+	return pageID, err
+}
+
+func (e *Engine) loadIndexes() {
+	for _, tableName := range e.catalog.GetAllTables() {
+		tableID, _ := e.catalog.GetTableID(tableName)
+		if rootPageID, ok := e.catalog.GetIndexRoot(tableID); ok && rootPageID != types.InvalidPageID {
+			e.indexes[tableID] = index.LoadBTree(e.bufferPool, rootPageID, 64)
+		}
+	}
+}
+
+// recover performs crash recovery.
+func (e *Engine) recover() error {
+	walPath := filepath.Join(e.dataDir, "wal.log")
+
+	// Check if WAL exists
+	if _, err := os.Stat(walPath); os.IsNotExist(err) {
+		return nil // Nothing to recover
+	}
+
+	fmt.Println("Performing crash recovery...")
+
+	rm := wal.NewRecoveryManager(walPath, e.walWriter)
+
+	// Set recovery callbacks
+	rm.SetCallbacks(
+		func(record *wal.LogRecord) error {
+			return e.applyRedo(record)
+		},
+		func(record *wal.LogRecord) error {
+			return e.applyUndo(record)
+		},
+	)
+
+	if err := rm.Recover(); err != nil {
+		return err
+	}
+
+	// Flush all dirty pages after recovery
+	if err := e.bufferPool.FlushAllPages(); err != nil {
+		return fmt.Errorf("failed to flush pages after recovery: %w", err)
+	}
+
+	// Update transaction manager's next ID
+	att := rm.GetActiveTxnTable()
+	maxTxnID := types.TxnID(0)
+	for txnID := range att {
+		if txnID > maxTxnID {
+			maxTxnID = txnID
+		}
+	}
+	e.txnManager.SetNextTxnID(maxTxnID + 1)
+
+	return nil
+}
+
+func (e *Engine) applyRedo(record *wal.LogRecord) error {
+	switch record.Type {
+	case types.LogRecordInsert, types.LogRecordUpdate:
+		tuple, err := types.DeserializeTuple(record.AfterImage)
+		if err != nil {
+			return err
+		}
+		e.mvccStore.RestoreTuple(tuple)
+
+	case types.LogRecordDelete:
+		tuple, err := types.DeserializeTuple(record.BeforeImage)
+		if err != nil {
+			return err
+		}
+		tuple.XMax = record.TxnID
+		e.mvccStore.RestoreTuple(tuple)
+	}
+
+	return nil
+}
+
+func (e *Engine) applyUndo(record *wal.LogRecord) error {
+	switch record.Type {
+	case types.LogRecordInsert:
+		e.mvccStore.RollbackTransaction(record.TxnID)
+
+	case types.LogRecordUpdate, types.LogRecordDelete:
+		oldTuple, err := types.DeserializeTuple(record.BeforeImage)
+		if err != nil {
+			return err
+		}
+		oldTuple.XMax = types.InvalidTxnID
+		e.mvccStore.RestoreTuple(oldTuple)
+	}
+
+	return nil
+}
+
+// Execute executes a SQL statement.
+func (e *Engine) Execute(sqlStr string) *sql.Result {
+	return e.executor.Execute(sqlStr)
+}
+
+// CreateIndex creates a B-Tree index on a table's primary key.
+func (e *Engine) CreateIndex(tableName string) error {
+	tableID, ok := e.catalog.GetTableID(tableName)
+	if !ok {
+		return fmt.Errorf("table %s not found", tableName)
+	}
+
+	// Check if index already exists
+	if _, exists := e.indexes[tableID]; exists {
+		return fmt.Errorf("index already exists for table %s", tableName)
+	}
+
+	// Create B-Tree
+	btree, err := index.NewBTree(e.bufferPool, 64)
+	if err != nil {
+		return err
+	}
+
+	// Index existing data
+	heap := e.catalog.GetTableHeap(tableID)
+	tuples, err := heap.Scan()
+	if err != nil {
+		return err
+	}
+
+	for _, t := range tuples {
+		// Use RowID as key for now
+		key := make([]byte, 8)
+		key[0] = byte(t.Tuple.RowID)
+		key[1] = byte(t.Tuple.RowID >> 8)
+		key[2] = byte(t.Tuple.RowID >> 16)
+		key[3] = byte(t.Tuple.RowID >> 24)
+
+		rid := index.RID{
+			PageID:  t.PageID,
+			SlotNum: t.SlotNum,
+			TableID: tableID,
+		}
+
+		btree.Insert(key, rid)
+	}
+
+	e.indexes[tableID] = btree
+	e.catalog.SetIndexRoot(tableID, btree.GetRootPageID())
+
+	return nil
+}
+
+// Checkpoint creates a checkpoint.
+func (e *Engine) Checkpoint() error {
+	// Flush all dirty pages
+	if err := e.bufferPool.FlushAllPages(); err != nil {
+		return err
+	}
+
+	// Get dirty pages for checkpoint record
+	dirtyPages := e.bufferPool.GetDirtyPages()
+	activeTxns := e.txnManager.GetActiveTxns()
+
+	_, err := e.walWriter.LogCheckpoint(activeTxns, dirtyPages)
+	return err
+}
+
+// Close shuts down the engine.
+func (e *Engine) Close() error {
+	// Flush any pending writes
+	if err := e.walWriter.Flush(); err != nil {
+		return err
+	}
+
+	// Flush all dirty pages
+	if err := e.bufferPool.FlushAllPages(); err != nil {
+		return err
+	}
+
+	// Sync disk
+	if err := e.diskManager.Sync(); err != nil {
+		return err
+	}
+
+	// Close files
+	if err := e.diskManager.Close(); err != nil {
+		return err
+	}
+
+	return e.walWriter.Close()
+}
+
+// Stats returns engine statistics.
+func (e *Engine) Stats() map[string]interface{} {
+	hits, misses, cached := e.bufferPool.Stats()
+	hitRate := float64(0)
+	if hits+misses > 0 {
+		hitRate = float64(hits) / float64(hits+misses) * 100
+	}
+
+	return map[string]interface{}{
+		"wal_current_lsn":    e.walWriter.GetCurrentLSN(),
+		"wal_flushed_lsn":    e.walWriter.GetFlushedLSN(),
+		"active_txns":        len(e.txnManager.GetActiveTxns()),
+		"buffer_pool_hits":   hits,
+		"buffer_pool_misses": misses,
+		"buffer_pool_cached": cached,
+		"buffer_hit_rate":    fmt.Sprintf("%.1f%%", hitRate),
+		"disk_pages":         e.diskManager.GetNumPages(),
+		"tables":             len(e.catalog.GetAllTables()),
+	}
+}
+
+// GetCatalog returns the catalog (for executor).
+func (e *Engine) GetCatalog() *storage.Catalog {
+	return e.catalog
+}
+
+// GetBufferPool returns the buffer pool (for executor).
+func (e *Engine) GetBufferPool() *storage.BufferPool {
+	return e.bufferPool
+}
+
+// GetIndex returns the index for a table.
+func (e *Engine) GetIndex(tableID uint32) *index.BTree {
+	return e.indexes[tableID]
+}
