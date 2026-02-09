@@ -21,7 +21,6 @@ type Engine struct {
 	bufferPool  *storage.BufferPool
 	catalog     *storage.Catalog
 	txnManager  *txn.Manager
-	mvccStore   *txn.MVCCStore
 	executor    *sql.Executor
 	indexes     map[uint32]*index.BTree // tableID -> index
 }
@@ -100,12 +99,10 @@ func New(cfg Config) (*Engine, error) {
 		}
 	}
 
-	// Initialize MVCC store (still used for version tracking)
-	mvccStore := txn.NewMVCCStore()
 	txnManager := txn.NewManager(walWriter)
 
 	// Create executor
-	executor := sql.NewExecutor(mvccStore, txnManager, walWriter)
+	executor := sql.NewExecutor(txnManager, walWriter)
 	executor.SetStorage(catalog, bufferPool)
 
 	e := &Engine{
@@ -115,7 +112,6 @@ func New(cfg Config) (*Engine, error) {
 		bufferPool:  bufferPool,
 		catalog:     catalog,
 		txnManager:  txnManager,
-		mvccStore:   mvccStore,
 		executor:    executor,
 		indexes:     make(map[uint32]*index.BTree),
 	}

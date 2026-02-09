@@ -11,8 +11,6 @@ import (
 
 // Executor executes SQL statements.
 type Executor struct {
-	// In-memory MVCC store (for version tracking)
-	mvccStore  *txn.MVCCStore
 	txnManager *txn.Manager
 	walWriter  *wal.Writer
 
@@ -33,9 +31,8 @@ type Result struct {
 }
 
 // NewExecutor creates a new SQL executor.
-func NewExecutor(store *txn.MVCCStore, txnManager *txn.Manager, walWriter *wal.Writer) *Executor {
+func NewExecutor(txnManager *txn.Manager, walWriter *wal.Writer) *Executor {
 	return &Executor{
-		mvccStore:  store,
 		txnManager: txnManager,
 		walWriter:  walWriter,
 	}
@@ -108,9 +105,6 @@ func (e *Executor) executeRollback() *Result {
 		return &Result{Error: fmt.Errorf("no transaction in progress")}
 	}
 	txnID := e.currentTxn.ID
-
-	// Rollback in MVCC store
-	e.mvccStore.RollbackTransaction(e.currentTxn.ID)
 
 	if err := e.txnManager.Rollback(e.currentTxn); err != nil {
 		return &Result{Error: err}
