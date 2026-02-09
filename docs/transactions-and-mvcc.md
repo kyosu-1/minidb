@@ -125,7 +125,7 @@ type Tuple struct {
     Cid     CommandID // トランザクション内のコマンド順序
     TableID uint32
     RowID   uint64
-    Data    []byte    // 実際の行データ（JSON）
+    Data    []byte    // 実際の行データ（バイナリ）
 }
 ```
 

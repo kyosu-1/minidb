@@ -159,7 +159,7 @@ sequenceDiagram
     E->>C: GetSchema(tableName)
     E->>E: getTransaction() — 明示 or Auto-Commit
     E->>E: 値を評価して rowData を構築
-    E->>E: JSON シリアライズ → Tuple 作成
+    E->>E: バイナリシリアライズ → Tuple 作成
     Note over E: XMin=TxnID, XMax=0
     E->>H: Insert(tuple)
     H-->>E: (pageID, slotNum)
@@ -185,7 +185,7 @@ sequenceDiagram
         alt 不可視
             Note over E: スキップ
         else 可視
-            E->>E: JSON デシリアライズ → rowData
+            E->>E: バイナリデシリアライズ → rowData
             E->>E: WHERE 条件を評価
             alt 条件に合致
                 E->>E: 結果行に追加
