@@ -24,17 +24,20 @@ var (
 
 // Page represents a fixed-size disk page.
 //
-// Layout:
+// Layout (slotted page):
 // +-------------------+
-// | Header (24 bytes) |
+// | Header (28 bytes) |
+// +-------------------+
+// | Slot Array →      |
 // +-------------------+
 // | Free Space        |
 // |                   |
 // +-------------------+
-// | Tuple Data ←      |
+// | ← Tuple Data      |
 // +-------------------+
-// | Slot Array →      |
-// +-------------------+
+//
+// Slot array grows forward from header; tuple data grows backward from page end.
+// FreeSpaceOffset = end of slot array, FreeSpaceEnd = start of tuple data.
 //
 // Header format:
 //   PageID (4) + PageType (1) + Reserved (3) + LSN (8) +
@@ -132,8 +135,9 @@ func (p *Page) SetNextPageID(nextID types.PageID) {
 const slotSize = 4
 
 // getSlot returns the offset and length for a slot.
+// Slots are stored forward from the header: slot 0 at PageHeaderSize, slot 1 at PageHeaderSize+4, etc.
 func (p *Page) getSlot(slotNum uint16) (offset uint16, length uint16) {
-	slotPos := PageSize - (int(slotNum)+1)*slotSize
+	slotPos := PageHeaderSize + int(slotNum)*slotSize
 	offset = binary.LittleEndian.Uint16(p.Data[slotPos : slotPos+2])
 	length = binary.LittleEndian.Uint16(p.Data[slotPos+2 : slotPos+4])
 	return
@@ -141,7 +145,7 @@ func (p *Page) getSlot(slotNum uint16) (offset uint16, length uint16) {
 
 // setSlot sets the offset and length for a slot.
 func (p *Page) setSlot(slotNum uint16, offset, length uint16) {
-	slotPos := PageSize - (int(slotNum)+1)*slotSize
+	slotPos := PageHeaderSize + int(slotNum)*slotSize
 	binary.LittleEndian.PutUint16(p.Data[slotPos:slotPos+2], offset)
 	binary.LittleEndian.PutUint16(p.Data[slotPos+2:slotPos+4], length)
 }
@@ -176,6 +180,9 @@ func (p *Page) InsertTuple(data []byte) (uint16, error) {
 	slotNum := p.GetSlotCount()
 	p.setSlot(slotNum, newEnd, uint16(dataLen))
 	p.setSlotCount(slotNum + 1)
+
+	// Update FreeSpaceOffset to track end of slot array
+	p.setFreeSpaceOffset(uint16(PageHeaderSize) + (slotNum+1)*uint16(slotSize))
 
 	p.IsDirty = true
 	return slotNum, nil
