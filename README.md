@@ -24,7 +24,7 @@
 ┌────────────────────────────────────────┼────────────────────────┐
 │                    Transaction Layer   │                         │
 │   ┌──────────────────┐    ┌───────────┴──────────┐              │
-│   │   TxnManager     │    │     MVCC Store       │              │
+│   │   TxnManager     │    │   MVCC Snapshot      │              │
 │   │ BEGIN/COMMIT/    │    │  Snapshot Isolation  │              │
 │   │ ROLLBACK         │    │  Visibility Check    │              │
 │   └──────────────────┘    └──────────────────────┘              │
@@ -67,6 +67,7 @@
 
 ```
 minidb/
+├── .github/workflows/test.yml   # CI（GitHub Actions）
 ├── cmd/minidb/main.go           # エントリーポイント（REPL）
 ├── internal/
 │   ├── engine/engine.go         # データベースエンジン
@@ -83,7 +84,7 @@ minidb/
 │   │   └── executor.go          # 実行エンジン
 │   ├── txn/
 │   │   ├── transaction.go       # トランザクション管理
-│   │   └── mvcc.go              # MVCC実装
+│   │   └── mvcc.go              # MVCCスナップショット可視性
 │   └── wal/
 │       ├── log.go               # ログレコード定義
 │       ├── writer.go            # ログ書き込み
@@ -231,21 +232,21 @@ func (w *Writer) LogCommit(txnID) (LSN, error) {
 
 ```go
 func (s *Snapshot) IsVisible(tuple *Tuple) bool {
-    // 作成トランザクションがコミット済みか？
-    if !s.isTxnCommitted(tuple.XMin) {
+    // 作成トランザクションが可視か？
+    if !s.isTxnVisible(tuple.XMin) {
         return false
     }
-    
+
     // 削除されていないか？
-    if tuple.XMax == 0 {
+    if tuple.XMax == InvalidTxnID {
         return true  // 削除されていない
     }
-    
+
     // 削除トランザクションがまだ見えない？
-    if !s.isTxnCommitted(tuple.XMax) {
+    if !s.isTxnVisible(tuple.XMax) {
         return true  // まだ削除は見えない
     }
-    
+
     return false  // 削除済み
 }
 ```
