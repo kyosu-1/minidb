@@ -13,52 +13,62 @@
 
 ## アーキテクチャ
 
-```
-┌─────────────────────────────────────────────────────────────────┐
-│                          SQL Layer                               │
-│   ┌──────────┐    ┌──────────┐    ┌──────────┐                  │
-│   │  Lexer   │───▶│  Parser  │───▶│ Executor │                  │
-│   └──────────┘    └──────────┘    └──────────┘                  │
-└────────────────────────────────────────┬────────────────────────┘
-                                         │
-┌────────────────────────────────────────┼────────────────────────┐
-│                    Transaction Layer   │                         │
-│   ┌──────────────────┐    ┌───────────┴──────────┐              │
-│   │   TxnManager     │    │   MVCC Snapshot      │              │
-│   │ BEGIN/COMMIT/    │    │  Snapshot Isolation  │              │
-│   │ ROLLBACK         │    │  Visibility Check    │              │
-│   └──────────────────┘    └──────────────────────┘              │
-└────────────────────────────────────────┬────────────────────────┘
-                                         │
-┌────────────────────────────────────────┼────────────────────────┐
-│                    Storage Layer       │                         │
-│   ┌──────────────┐  ┌─────────────┐  ┌┴────────────┐            │
-│   │ Buffer Pool  │  │   Catalog   │  │  B-Tree     │            │
-│   │   (LRU)      │  │  (Schema)   │  │  Index      │            │
-│   └──────┬───────┘  └─────────────┘  └─────────────┘            │
-│          │                                                       │
-│   ┌──────┴───────┐  ┌─────────────┐                             │
-│   │ DiskManager  │  │  TableHeap  │                             │
-│   │  Page I/O    │  │  (Rows)     │                             │
-│   └──────────────┘  └─────────────┘                             │
-└────────────────────────────────────────┬────────────────────────┘
-                                         │
-┌────────────────────────────────────────┼────────────────────────┐
-│                      WAL Layer         │                         │
-│   ┌──────────────────┐    ┌───────────┴──────────┐              │
-│   │   WAL Writer     │    │  RecoveryManager     │              │
-│   │  Log + fsync()   │    │  ARIES Algorithm     │              │
-│   └──────────────────┘    └──────────────────────┘              │
-└────────────────────────────────────────┬────────────────────────┘
-                                         │
-                                         ▼
-┌─────────────────────────────────────────────────────────────────┐
-│                         Disk Files                               │
-│   ┌──────────────┐  ┌──────────────┐  ┌──────────────┐         │
-│   │   data.db    │  │   wal.log    │  │ minidb.meta  │         │
-│   │  (4KB pages) │  │  (log recs)  │  │ (catalog ID) │         │
-│   └──────────────┘  └──────────────┘  └──────────────┘         │
-└─────────────────────────────────────────────────────────────────┘
+```mermaid
+graph TD
+    subgraph REPL["REPL (cmd/minidb)"]
+        Main["main.go"]
+    end
+
+    subgraph Engine["Engine (engine.go)"]
+        E["Engine"]
+    end
+
+    subgraph SQL["SQL Layer"]
+        Lexer --> Parser --> Executor
+    end
+
+    subgraph Txn["Transaction Layer"]
+        TxnManager["TxnManager<br/>BEGIN / COMMIT / ROLLBACK"]
+        Snapshot["MVCC Snapshot<br/>Visibility Check"]
+        TxnManager --> Snapshot
+    end
+
+    subgraph Storage["Storage Layer"]
+        Catalog["Catalog<br/>Schema"]
+        TableHeap["TableHeap<br/>Rows"]
+        BTree["B-Tree Index"]
+        BufferPool["BufferPool<br/>LRU Cache"]
+        DiskManager["DiskManager<br/>Page I/O"]
+
+        Catalog --> BufferPool
+        TableHeap --> BufferPool
+        BTree --> BufferPool
+        BufferPool --> DiskManager
+    end
+
+    subgraph WAL["WAL Layer"]
+        Writer["WAL Writer<br/>Log + fsync"]
+        Recovery["RecoveryManager<br/>ARIES 3-Phase"]
+    end
+
+    subgraph Disk["Disk Files"]
+        data["data.db<br/>4KB Pages"]
+        wallog["wal.log<br/>Log Records"]
+        meta["minidb.meta<br/>Catalog PageID"]
+    end
+
+    Main --> E
+    E --> Executor
+    Executor --> TxnManager
+    Executor --> Writer
+    Executor --> Catalog
+    Executor --> BufferPool
+    TxnManager --> Writer
+    E --> Recovery
+    Recovery --> Writer
+    DiskManager --> data
+    Writer --> wallog
+    E --> meta
 ```
 
 ---
