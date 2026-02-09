@@ -497,6 +497,125 @@ func TestEngineMultipleInsertSelect(t *testing.T) {
 	}
 }
 
+func TestEngineVacuumAfterDelete(t *testing.T) {
+	e := newTestEngine(t)
+	defer e.Close()
+
+	e.Execute("CREATE TABLE users (id INT, name TEXT)")
+	e.Execute("INSERT INTO users VALUES (1, 'alice')")
+	e.Execute("INSERT INTO users VALUES (2, 'bob')")
+
+	e.Execute("DELETE FROM users WHERE id = 1")
+
+	result, err := e.Vacuum()
+	if err != nil {
+		t.Fatalf("Vacuum() error = %v", err)
+	}
+	if result.TotalRemoved() != 1 {
+		t.Errorf("TotalRemoved = %d, want 1", result.TotalRemoved())
+	}
+
+	// Remaining data should be intact
+	sel := e.Execute("SELECT * FROM users")
+	if sel.Error != nil {
+		t.Fatalf("SELECT error = %v", sel.Error)
+	}
+	if len(sel.Rows) != 1 {
+		t.Errorf("rows after vacuum = %d, want 1", len(sel.Rows))
+	}
+}
+
+func TestEngineVacuumAfterUpdate(t *testing.T) {
+	e := newTestEngine(t)
+	defer e.Close()
+
+	e.Execute("CREATE TABLE users (id INT, name TEXT)")
+	e.Execute("INSERT INTO users VALUES (1, 'alice')")
+
+	e.Execute("UPDATE users SET name = 'bob' WHERE id = 1")
+
+	result, err := e.Vacuum()
+	if err != nil {
+		t.Fatalf("Vacuum() error = %v", err)
+	}
+	// The old version of the updated row should be removed
+	if result.TotalRemoved() != 1 {
+		t.Errorf("TotalRemoved = %d, want 1", result.TotalRemoved())
+	}
+
+	sel := e.Execute("SELECT * FROM users")
+	if sel.Error != nil {
+		t.Fatalf("SELECT error = %v", sel.Error)
+	}
+	if len(sel.Rows) != 1 {
+		t.Errorf("rows after vacuum = %d, want 1", len(sel.Rows))
+	}
+}
+
+func TestEngineVacuumIdempotent(t *testing.T) {
+	e := newTestEngine(t)
+	defer e.Close()
+
+	e.Execute("CREATE TABLE users (id INT, name TEXT)")
+	e.Execute("INSERT INTO users VALUES (1, 'alice')")
+	e.Execute("DELETE FROM users WHERE id = 1")
+
+	r1, err := e.Vacuum()
+	if err != nil {
+		t.Fatalf("first Vacuum() error = %v", err)
+	}
+	if r1.TotalRemoved() != 1 {
+		t.Errorf("first TotalRemoved = %d, want 1", r1.TotalRemoved())
+	}
+
+	r2, err := e.Vacuum()
+	if err != nil {
+		t.Fatalf("second Vacuum() error = %v", err)
+	}
+	if r2.TotalRemoved() != 0 {
+		t.Errorf("second TotalRemoved = %d, want 0", r2.TotalRemoved())
+	}
+}
+
+func TestEngineVacuumSkipsAbortedTxn(t *testing.T) {
+	e := newTestEngine(t)
+	defer e.Close()
+
+	e.Execute("CREATE TABLE users (id INT, name TEXT)")
+	e.Execute("INSERT INTO users VALUES (1, 'alice')")
+
+	// DELETE inside a transaction that gets rolled back
+	e.Execute("BEGIN")
+	e.Execute("DELETE FROM users WHERE id = 1")
+	e.Execute("ROLLBACK")
+
+	result, err := e.Vacuum()
+	if err != nil {
+		t.Fatalf("Vacuum() error = %v", err)
+	}
+	// Should NOT remove the tuple because the DELETE was aborted
+	if result.TotalRemoved() != 0 {
+		t.Errorf("TotalRemoved = %d, want 0 (aborted DELETE)", result.TotalRemoved())
+	}
+}
+
+func TestEngineVacuumNoDeadTuples(t *testing.T) {
+	e := newTestEngine(t)
+	defer e.Close()
+
+	e.Execute("CREATE TABLE users (id INT, name TEXT)")
+	e.Execute("INSERT INTO users VALUES (1, 'alice')")
+	e.Execute("INSERT INTO users VALUES (2, 'bob')")
+
+	result, err := e.Vacuum()
+	if err != nil {
+		t.Fatalf("Vacuum() error = %v", err)
+	}
+	if result.TotalRemoved() != 0 {
+		t.Errorf("TotalRemoved = %d, want 0", result.TotalRemoved())
+	}
+}
+
 func itoa(n int) string {
 	if n == 0 {
 		return "0"

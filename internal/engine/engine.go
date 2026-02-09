@@ -447,3 +447,75 @@ func (e *Engine) GetBufferPool() *storage.BufferPool {
 func (e *Engine) GetIndex(tableID uint32) *index.BTree {
 	return e.indexes[tableID]
 }
+
+// VacuumResult holds the result of a VACUUM operation.
+type VacuumResult struct {
+	Tables []VacuumTableStats
+}
+
+// TotalRemoved returns the total number of dead tuples removed.
+func (r *VacuumResult) TotalRemoved() int {
+	total := 0
+	for _, t := range r.Tables {
+		total += t.TuplesRemoved
+	}
+	return total
+}
+
+// VacuumTableStats holds per-table VACUUM statistics.
+type VacuumTableStats struct {
+	TableName     string
+	TuplesScanned int
+	TuplesRemoved int
+}
+
+// Vacuum removes dead tuples from all tables.
+func (e *Engine) Vacuum() (*VacuumResult, error) {
+	globalXmin := e.txnManager.GetGlobalXmin()
+	result := &VacuumResult{}
+
+	for _, tableName := range e.catalog.GetAllTables() {
+		tableID, ok := e.catalog.GetTableID(tableName)
+		if !ok {
+			continue
+		}
+
+		heap := e.catalog.GetTableHeap(tableID)
+		tuples, err := heap.Scan()
+		if err != nil {
+			return nil, fmt.Errorf("vacuum scan %s: %w", tableName, err)
+		}
+
+		stats := VacuumTableStats{
+			TableName:     tableName,
+			TuplesScanned: len(tuples),
+		}
+
+		for _, t := range tuples {
+			// Dead tuple conditions:
+			// 1. XMax is set (deleted/updated)
+			// 2. XMax < globalXmin (invisible to all active txns)
+			// 3. XMax txn actually committed (not aborted)
+			if t.Tuple.XMax != types.InvalidTxnID &&
+				t.Tuple.XMax < globalXmin &&
+				e.txnManager.IsTxnCommitted(t.Tuple.XMax) {
+				if err := heap.Delete(t.PageID, t.SlotNum); err != nil {
+					return nil, fmt.Errorf("vacuum delete %s: %w", tableName, err)
+				}
+				stats.TuplesRemoved++
+			}
+		}
+
+		result.Tables = append(result.Tables, stats)
+	}
+
+	// Flush all modified pages
+	if err := e.bufferPool.FlushAllPages(); err != nil {
+		return nil, fmt.Errorf("vacuum flush: %w", err)
+	}
+
+	// Clean up committed txn records that are no longer needed
+	e.txnManager.PruneCommittedBefore(globalXmin)
+
+	return result, nil
+}

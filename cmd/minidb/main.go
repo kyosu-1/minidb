@@ -81,6 +81,9 @@ func main() {
 				fmt.Println("Checkpoint created.")
 			}
 			continue
+		case lower == "vacuum":
+			vacuumDB(db)
+			continue
 		case lower == "tables" || lower == "\\dt":
 			printTables(db)
 			continue
@@ -108,6 +111,7 @@ Commands:
   stats, \s         Show database statistics
   tables, \dt       List all tables
   checkpoint        Create a checkpoint
+  vacuum            Remove dead tuples (MVCC garbage collection)
   create index on <table>  Create B-Tree index
   exit, quit        Exit the database
 
@@ -150,6 +154,25 @@ Examples:
   stats
 `
 	fmt.Println(help)
+}
+
+func vacuumDB(db *engine.Engine) {
+	result, err := db.Vacuum()
+	if err != nil {
+		fmt.Printf("VACUUM failed: %v\n", err)
+		return
+	}
+	total := result.TotalRemoved()
+	if total == 0 {
+		fmt.Println("VACUUM: removed 0 dead tuples.")
+	} else {
+		fmt.Printf("VACUUM: removed %d dead tuples.\n", total)
+		for _, ts := range result.Tables {
+			if ts.TuplesRemoved > 0 {
+				fmt.Printf("  %s: scanned %d, removed %d\n", ts.TableName, ts.TuplesScanned, ts.TuplesRemoved)
+			}
+		}
+	}
 }
 
 func printStats(db *engine.Engine) {

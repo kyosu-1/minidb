@@ -8,6 +8,7 @@
 - **MVCC** - スナップショット分離による並行制御
 - **B-Treeインデックス** - 高速検索
 - **SQLパーサー** - CREATE, INSERT, SELECT, UPDATE, DELETE
+- **VACUUM** - MVCCデッドタプルのガベージコレクション
 
 ---
 
@@ -152,6 +153,13 @@ UPDATE 1
 
 minidb> COMMIT
 COMMIT (txn 5)
+
+minidb> DELETE FROM users WHERE id = 1
+DELETE 1
+
+minidb> vacuum
+VACUUM: removed 1 dead tuples.
+  users: scanned 2, removed 1
 
 minidb> stats
 ╔══════════════════════════════════════════╗
@@ -352,7 +360,6 @@ Phase 3: Undo
 | クエリオプティマイザ | 実行計画の最適化 |
 | JOIN | 複数テーブルの結合 |
 | セカンダリインデックス | 任意カラムへのインデックス |
-| VACUUM | 古いMVCCバージョンのガベージコレクション |
 
 ---
 

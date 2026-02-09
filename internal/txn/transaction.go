@@ -12,16 +12,19 @@ import (
 // Manager handles transaction lifecycle and coordination.
 type Manager struct {
 	mu sync.RWMutex
-	
+
 	// Transaction ID generator (atomic for thread safety)
 	nextTxnID uint64
-	
+
 	// Active transactions
 	activeTxns map[types.TxnID]*Transaction
-	
+
+	// Committed transactions (for VACUUM dead tuple validation)
+	committedTxns map[types.TxnID]bool
+
 	// WAL writer
 	walWriter *wal.Writer
-	
+
 	// Global snapshot for visibility
 	globalXmin types.TxnID // Oldest active transaction
 }
@@ -54,10 +57,11 @@ const (
 // NewManager creates a new transaction manager.
 func NewManager(walWriter *wal.Writer) *Manager {
 	return &Manager{
-		nextTxnID:  1,
-		activeTxns: make(map[types.TxnID]*Transaction),
-		walWriter:  walWriter,
-		globalXmin: types.MaxTxnID,
+		nextTxnID:     1,
+		activeTxns:    make(map[types.TxnID]*Transaction),
+		committedTxns: make(map[types.TxnID]bool),
+		walWriter:     walWriter,
+		globalXmin:    types.MaxTxnID,
 	}
 }
 
@@ -110,16 +114,17 @@ func (m *Manager) Commit(txn *Transaction) error {
 	}
 	
 	txn.Status = types.TxnStatusCommitted
-	
+
 	// Release locks
 	txn.HeldLocks = nil
-	
-	// Remove from active transactions
+
+	// Remove from active transactions and record as committed
 	m.mu.Lock()
 	delete(m.activeTxns, txn.ID)
+	m.committedTxns[txn.ID] = true
 	m.updateGlobalXmin()
 	m.mu.Unlock()
-	
+
 	return nil
 }
 
@@ -220,4 +225,22 @@ func (txn *Transaction) NextCommandID() types.CommandID {
 // SetNextTxnID sets the next transaction ID (used during recovery).
 func (m *Manager) SetNextTxnID(id types.TxnID) {
 	atomic.StoreUint64(&m.nextTxnID, uint64(id))
+}
+
+// IsTxnCommitted returns true if the given transaction was committed.
+func (m *Manager) IsTxnCommitted(txnID types.TxnID) bool {
+	m.mu.RLock()
+	defer m.mu.RUnlock()
+	return m.committedTxns[txnID]
+}
+
+// PruneCommittedBefore removes committed transaction records older than cutoff.
+func (m *Manager) PruneCommittedBefore(cutoff types.TxnID) {
+	m.mu.Lock()
+	defer m.mu.Unlock()
+	for txnID := range m.committedTxns {
+		if txnID < cutoff {
+			delete(m.committedTxns, txnID)
+		}
+	}
 }

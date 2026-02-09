@@ -239,6 +239,59 @@ func TestSetNextTxnID(t *testing.T) {
 	}
 }
 
+func TestIsTxnCommitted(t *testing.T) {
+	m := newTestManager(t)
+
+	txn1 := m.Begin()
+	txn2 := m.Begin()
+	txn1ID := txn1.ID
+	txn2ID := txn2.ID
+
+	// Neither committed yet
+	if m.IsTxnCommitted(txn1ID) {
+		t.Error("txn1 should not be committed yet")
+	}
+
+	m.Commit(txn1)
+	if !m.IsTxnCommitted(txn1ID) {
+		t.Error("txn1 should be committed")
+	}
+
+	// Rolled back txn should NOT be marked committed
+	m.Rollback(txn2)
+	if m.IsTxnCommitted(txn2ID) {
+		t.Error("rolled back txn2 should not be committed")
+	}
+}
+
+func TestPruneCommittedBefore(t *testing.T) {
+	m := newTestManager(t)
+
+	txn1 := m.Begin()
+	txn2 := m.Begin()
+	txn3 := m.Begin()
+	m.Commit(txn1)
+	m.Commit(txn2)
+	m.Commit(txn3)
+
+	if !m.IsTxnCommitted(txn1.ID) || !m.IsTxnCommitted(txn2.ID) || !m.IsTxnCommitted(txn3.ID) {
+		t.Fatal("all three should be committed")
+	}
+
+	// Prune committed txns before txn3's ID
+	m.PruneCommittedBefore(txn3.ID)
+
+	if m.IsTxnCommitted(txn1.ID) {
+		t.Error("txn1 should be pruned")
+	}
+	if m.IsTxnCommitted(txn2.ID) {
+		t.Error("txn2 should be pruned")
+	}
+	if !m.IsTxnCommitted(txn3.ID) {
+		t.Error("txn3 should NOT be pruned (not < cutoff)")
+	}
+}
+
 func TestManagerWithNilWALWriter(t *testing.T) {
 	m := NewManager(nil)
 

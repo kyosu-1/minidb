@@ -248,7 +248,68 @@ flowchart TD
 
 ---
 
-## 6. Auto-Commit
+## 6. VACUUM — デッドタプルのガベージコレクション
+
+### 問題
+
+UPDATE/DELETE は MVCC の仕組みにより旧バージョンの XMax を設定するだけで、物理的にはタプルを削除しない。これらの「デッドタプル」が蓄積し続けると、ストレージが肥大化し、Scan のパフォーマンスも劣化する。
+
+### デッドタプルの判定条件
+
+タプルが安全に回収可能な条件（3 つ全て満たす）:
+
+| # | 条件 | 理由 |
+|---|------|------|
+| 1 | `XMax != InvalidTxnID` | 削除マークが付いている |
+| 2 | `XMax < GlobalXmin` | 全アクティブトランザクションから不可視 |
+| 3 | XMax のトランザクションがコミット済み | アボートされた DELETE/UPDATE は回収しない |
+
+```mermaid
+flowchart TD
+    A["Scan() で全タプルを取得"] --> B{"XMax != 0?"}
+    B -- No --> C["SKIP（生存中）"]
+    B -- Yes --> D{"XMax < GlobalXmin?"}
+    D -- No --> E["SKIP（まだ可視の可能性）"]
+    D -- Yes --> F{"IsTxnCommitted(XMax)?"}
+    F -- No --> G["SKIP（アボートされた変更）"]
+    F -- Yes --> H["DeleteTuple(pageID, slotNum)<br/>物理削除"]
+```
+
+### アボートされたトランザクションの扱い
+
+ROLLBACK 時、ヒープページ上の XMax 変更はランタイムでは戻されない（ARIES crash recovery の Undo でのみ復元される）。そのため、VACUUM がアボートされたトランザクションの XMax を持つタプルを誤って回収しないよう、`TxnManager` が `committedTxns` マップでコミット済みトランザクションを追跡する。
+
+```go
+// Commit 時に記録
+m.committedTxns[txn.ID] = true
+
+// VACUUM 時に確認
+if m.IsTxnCommitted(xmaxTxnID) {
+    // 安全に回収可能
+}
+```
+
+### WAL ログ
+
+VACUUM は WAL ログを書かない。VACUUM は冪等な操作であり、クラッシュ後に再実行しても同じ結果になるため、リカバリの対象にする必要がない。
+
+### 使用例
+
+```
+minidb> DELETE FROM users WHERE id = 1
+DELETE 1
+
+minidb> vacuum
+VACUUM: removed 1 dead tuples.
+  users: scanned 3, removed 1
+
+minidb> vacuum
+VACUUM: removed 0 dead tuples.
+```
+
+---
+
+## 7. Auto-Commit
 
 ### 単文の暗黙トランザクション
 
