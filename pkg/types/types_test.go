@@ -2,6 +2,7 @@ package types
 
 import (
 	"bytes"
+	"encoding/json"
 	"testing"
 )
 
@@ -230,5 +231,332 @@ func TestValueString(t *testing.T) {
 				t.Errorf("Value.String() = %q, want %q", got, tt.want)
 			}
 		})
+	}
+}
+
+// --- SerializeRow / DeserializeRow tests ---
+
+func TestSerializeDeserializeRowRoundTrip(t *testing.T) {
+	schema := &Schema{
+		TableName: "users",
+		Columns: []Column{
+			{Name: "id", Type: ValueTypeInt},
+			{Name: "name", Type: ValueTypeString},
+			{Name: "active", Type: ValueTypeBool},
+		},
+	}
+
+	values := map[string]Value{
+		"id":     {Type: ValueTypeInt, IntVal: 1},
+		"name":   {Type: ValueTypeString, StrVal: "Alice"},
+		"active": {Type: ValueTypeBool, BoolVal: true},
+	}
+
+	data, err := SerializeRow(schema, values)
+	if err != nil {
+		t.Fatalf("SerializeRow failed: %v", err)
+	}
+
+	// Expected: 1 byte bitmap + 8 (int64) + 2+5 (string) + 1 (bool) = 17 bytes
+	if len(data) != 17 {
+		t.Errorf("expected 17 bytes, got %d", len(data))
+	}
+
+	got, err := DeserializeRow(schema, data)
+	if err != nil {
+		t.Fatalf("DeserializeRow failed: %v", err)
+	}
+
+	if got["id"].IntVal != 1 {
+		t.Errorf("id: expected 1, got %d", got["id"].IntVal)
+	}
+	if got["name"].StrVal != "Alice" {
+		t.Errorf("name: expected Alice, got %s", got["name"].StrVal)
+	}
+	if got["active"].BoolVal != true {
+		t.Errorf("active: expected true, got %v", got["active"].BoolVal)
+	}
+}
+
+func TestRowNullHandling(t *testing.T) {
+	schema := &Schema{
+		TableName: "t",
+		Columns: []Column{
+			{Name: "a", Type: ValueTypeInt},
+			{Name: "b", Type: ValueTypeString},
+			{Name: "c", Type: ValueTypeBool},
+		},
+	}
+
+	// Partial NULLs: only "a" is set
+	values := map[string]Value{
+		"a": {Type: ValueTypeInt, IntVal: 42},
+	}
+
+	data, err := SerializeRow(schema, values)
+	if err != nil {
+		t.Fatalf("SerializeRow failed: %v", err)
+	}
+
+	got, err := DeserializeRow(schema, data)
+	if err != nil {
+		t.Fatalf("DeserializeRow failed: %v", err)
+	}
+
+	if got["a"].IntVal != 42 || got["a"].IsNull {
+		t.Errorf("a: expected 42 (non-null), got %v", got["a"])
+	}
+	if !got["b"].IsNull {
+		t.Errorf("b: expected NULL, got %v", got["b"])
+	}
+	if !got["c"].IsNull {
+		t.Errorf("c: expected NULL, got %v", got["c"])
+	}
+}
+
+func TestRowAllNulls(t *testing.T) {
+	schema := &Schema{
+		TableName: "t",
+		Columns: []Column{
+			{Name: "a", Type: ValueTypeInt},
+			{Name: "b", Type: ValueTypeString},
+		},
+	}
+
+	values := map[string]Value{}
+
+	data, err := SerializeRow(schema, values)
+	if err != nil {
+		t.Fatalf("SerializeRow failed: %v", err)
+	}
+
+	// Only bitmap, no column data
+	if len(data) != 1 {
+		t.Errorf("expected 1 byte (bitmap only), got %d", len(data))
+	}
+
+	got, err := DeserializeRow(schema, data)
+	if err != nil {
+		t.Fatalf("DeserializeRow failed: %v", err)
+	}
+
+	if !got["a"].IsNull {
+		t.Errorf("a: expected NULL")
+	}
+	if !got["b"].IsNull {
+		t.Errorf("b: expected NULL")
+	}
+}
+
+func TestRowEmptyString(t *testing.T) {
+	schema := &Schema{
+		TableName: "t",
+		Columns: []Column{
+			{Name: "s", Type: ValueTypeString},
+		},
+	}
+
+	values := map[string]Value{
+		"s": {Type: ValueTypeString, StrVal: ""},
+	}
+
+	data, err := SerializeRow(schema, values)
+	if err != nil {
+		t.Fatalf("SerializeRow failed: %v", err)
+	}
+
+	got, err := DeserializeRow(schema, data)
+	if err != nil {
+		t.Fatalf("DeserializeRow failed: %v", err)
+	}
+
+	if got["s"].IsNull {
+		t.Error("expected non-null empty string, got NULL")
+	}
+	if got["s"].StrVal != "" {
+		t.Errorf("expected empty string, got %q", got["s"].StrVal)
+	}
+}
+
+func TestRowNegativeInt(t *testing.T) {
+	schema := &Schema{
+		TableName: "t",
+		Columns: []Column{
+			{Name: "n", Type: ValueTypeInt},
+		},
+	}
+
+	values := map[string]Value{
+		"n": {Type: ValueTypeInt, IntVal: -9999},
+	}
+
+	data, err := SerializeRow(schema, values)
+	if err != nil {
+		t.Fatalf("SerializeRow failed: %v", err)
+	}
+
+	got, err := DeserializeRow(schema, data)
+	if err != nil {
+		t.Fatalf("DeserializeRow failed: %v", err)
+	}
+
+	if got["n"].IntVal != -9999 {
+		t.Errorf("expected -9999, got %d", got["n"].IntVal)
+	}
+}
+
+func TestRowMultiByteBitmap(t *testing.T) {
+	// 9 columns requires 2 bytes for the null bitmap
+	columns := make([]Column, 9)
+	values := make(map[string]Value)
+	for i := 0; i < 9; i++ {
+		name := string(rune('a' + i))
+		columns[i] = Column{Name: name, Type: ValueTypeInt}
+		values[name] = Value{Type: ValueTypeInt, IntVal: int64(i + 1)}
+	}
+
+	schema := &Schema{TableName: "t", Columns: columns}
+
+	data, err := SerializeRow(schema, values)
+	if err != nil {
+		t.Fatalf("SerializeRow failed: %v", err)
+	}
+
+	// 2 bytes bitmap + 9*8 bytes = 74
+	if len(data) != 74 {
+		t.Errorf("expected 74 bytes, got %d", len(data))
+	}
+
+	got, err := DeserializeRow(schema, data)
+	if err != nil {
+		t.Fatalf("DeserializeRow failed: %v", err)
+	}
+
+	for i := 0; i < 9; i++ {
+		name := string(rune('a' + i))
+		if got[name].IntVal != int64(i+1) {
+			t.Errorf("column %s: expected %d, got %d", name, i+1, got[name].IntVal)
+		}
+	}
+}
+
+func TestRowMultiByteBitmapWithNulls(t *testing.T) {
+	// 9 columns, columns 0 and 8 are NULL
+	columns := make([]Column, 9)
+	values := make(map[string]Value)
+	for i := 0; i < 9; i++ {
+		name := string(rune('a' + i))
+		columns[i] = Column{Name: name, Type: ValueTypeInt}
+		if i != 0 && i != 8 {
+			values[name] = Value{Type: ValueTypeInt, IntVal: int64(i)}
+		}
+	}
+
+	schema := &Schema{TableName: "t", Columns: columns}
+
+	data, err := SerializeRow(schema, values)
+	if err != nil {
+		t.Fatalf("SerializeRow failed: %v", err)
+	}
+
+	got, err := DeserializeRow(schema, data)
+	if err != nil {
+		t.Fatalf("DeserializeRow failed: %v", err)
+	}
+
+	if !got["a"].IsNull {
+		t.Error("column a should be NULL")
+	}
+	if !got["i"].IsNull {
+		t.Error("column i should be NULL")
+	}
+	if got["b"].IntVal != 1 {
+		t.Errorf("column b: expected 1, got %d", got["b"].IntVal)
+	}
+}
+
+func TestRowTruncatedData(t *testing.T) {
+	schema := &Schema{
+		TableName: "t",
+		Columns: []Column{
+			{Name: "id", Type: ValueTypeInt},
+		},
+	}
+
+	// Too short for bitmap
+	_, err := DeserializeRow(schema, []byte{})
+	if err == nil {
+		t.Error("expected error for empty data")
+	}
+
+	// Bitmap present but INT data truncated
+	_, err = DeserializeRow(schema, []byte{0x00, 0x01, 0x02})
+	if err == nil {
+		t.Error("expected error for truncated INT data")
+	}
+}
+
+func TestRowBoolFalse(t *testing.T) {
+	schema := &Schema{
+		TableName: "t",
+		Columns: []Column{
+			{Name: "flag", Type: ValueTypeBool},
+		},
+	}
+
+	values := map[string]Value{
+		"flag": {Type: ValueTypeBool, BoolVal: false},
+	}
+
+	data, err := SerializeRow(schema, values)
+	if err != nil {
+		t.Fatalf("SerializeRow failed: %v", err)
+	}
+
+	got, err := DeserializeRow(schema, data)
+	if err != nil {
+		t.Fatalf("DeserializeRow failed: %v", err)
+	}
+
+	if got["flag"].IsNull {
+		t.Error("expected non-null false, got NULL")
+	}
+	if got["flag"].BoolVal != false {
+		t.Errorf("expected false, got %v", got["flag"].BoolVal)
+	}
+}
+
+func TestRowSizeComparisonVsJSON(t *testing.T) {
+	schema := &Schema{
+		TableName: "users",
+		Columns: []Column{
+			{Name: "id", Type: ValueTypeInt},
+			{Name: "name", Type: ValueTypeString},
+			{Name: "active", Type: ValueTypeBool},
+		},
+	}
+
+	values := map[string]Value{
+		"id":     {Type: ValueTypeInt, IntVal: 1},
+		"name":   {Type: ValueTypeString, StrVal: "Alice"},
+		"active": {Type: ValueTypeBool, BoolVal: true},
+	}
+
+	binData, err := SerializeRow(schema, values)
+	if err != nil {
+		t.Fatalf("SerializeRow failed: %v", err)
+	}
+
+	jsonData, err := json.Marshal(values)
+	if err != nil {
+		t.Fatalf("json.Marshal failed: %v", err)
+	}
+
+	t.Logf("Binary size: %d bytes", len(binData))
+	t.Logf("JSON size:   %d bytes", len(jsonData))
+	t.Logf("Ratio:       %.1fx smaller", float64(len(jsonData))/float64(len(binData)))
+
+	if len(binData) >= len(jsonData) {
+		t.Errorf("binary (%d) should be smaller than JSON (%d)", len(binData), len(jsonData))
 	}
 }

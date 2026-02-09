@@ -186,3 +186,103 @@ type Column struct {
 	Type     ValueType
 	Nullable bool
 }
+
+// SerializeRow encodes a row as compact binary using the schema's column order.
+//
+// Format:
+//
+//	NullBitmap: ceil(numColumns/8) bytes, LSB first (bit i=1 → column i is NULL)
+//	Column values in schema order (NULLs skipped):
+//	  INT    → int64 little-endian (8 bytes)
+//	  STRING → uint16 LE length + UTF-8 bytes
+//	  BOOL   → 1 byte (0x00=false, 0x01=true)
+func SerializeRow(schema *Schema, values map[string]Value) ([]byte, error) {
+	numCols := len(schema.Columns)
+	bitmapLen := (numCols + 7) / 8
+	// Pre-allocate with estimated size
+	buf := make([]byte, bitmapLen, bitmapLen+numCols*8)
+
+	for i, col := range schema.Columns {
+		val, ok := values[col.Name]
+		if !ok || val.IsNull {
+			// Set null bit: byte = i/8, bit = i%8
+			buf[i/8] |= 1 << (uint(i) % 8)
+			continue
+		}
+		switch col.Type {
+		case ValueTypeInt:
+			b := make([]byte, 8)
+			binary.LittleEndian.PutUint64(b, uint64(val.IntVal))
+			buf = append(buf, b...)
+		case ValueTypeString:
+			sLen := len(val.StrVal)
+			if sLen > 65535 {
+				return nil, fmt.Errorf("string too long for column %s: %d bytes", col.Name, sLen)
+			}
+			b := make([]byte, 2)
+			binary.LittleEndian.PutUint16(b, uint16(sLen))
+			buf = append(buf, b...)
+			buf = append(buf, val.StrVal...)
+		case ValueTypeBool:
+			if val.BoolVal {
+				buf = append(buf, 0x01)
+			} else {
+				buf = append(buf, 0x00)
+			}
+		default:
+			return nil, fmt.Errorf("unsupported column type for column %s", col.Name)
+		}
+	}
+	return buf, nil
+}
+
+// DeserializeRow decodes binary row data back into a map using the schema.
+func DeserializeRow(schema *Schema, data []byte) (map[string]Value, error) {
+	numCols := len(schema.Columns)
+	bitmapLen := (numCols + 7) / 8
+
+	if len(data) < bitmapLen {
+		return nil, fmt.Errorf("data too short: need at least %d bytes for null bitmap, got %d", bitmapLen, len(data))
+	}
+
+	result := make(map[string]Value, numCols)
+	offset := bitmapLen
+
+	for i, col := range schema.Columns {
+		// Check null bit
+		if data[i/8]&(1<<(uint(i)%8)) != 0 {
+			result[col.Name] = Value{IsNull: true}
+			continue
+		}
+
+		switch col.Type {
+		case ValueTypeInt:
+			if offset+8 > len(data) {
+				return nil, fmt.Errorf("data truncated reading INT column %s", col.Name)
+			}
+			v := int64(binary.LittleEndian.Uint64(data[offset : offset+8]))
+			result[col.Name] = Value{Type: ValueTypeInt, IntVal: v}
+			offset += 8
+		case ValueTypeString:
+			if offset+2 > len(data) {
+				return nil, fmt.Errorf("data truncated reading STRING length for column %s", col.Name)
+			}
+			sLen := int(binary.LittleEndian.Uint16(data[offset : offset+2]))
+			offset += 2
+			if offset+sLen > len(data) {
+				return nil, fmt.Errorf("data truncated reading STRING data for column %s", col.Name)
+			}
+			result[col.Name] = Value{Type: ValueTypeString, StrVal: string(data[offset : offset+sLen])}
+			offset += sLen
+		case ValueTypeBool:
+			if offset+1 > len(data) {
+				return nil, fmt.Errorf("data truncated reading BOOL column %s", col.Name)
+			}
+			result[col.Name] = Value{Type: ValueTypeBool, BoolVal: data[offset] != 0}
+			offset++
+		default:
+			return nil, fmt.Errorf("unsupported column type for column %s", col.Name)
+		}
+	}
+	return result, nil
+}

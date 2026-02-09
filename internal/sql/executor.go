@@ -1,7 +1,6 @@
 package sql
 
 import (
-	"encoding/json"
 	"fmt"
 	"minidb/internal/storage"
 	"minidb/internal/txn"
@@ -180,7 +179,10 @@ func (e *Executor) executeInsert(stmt *InsertStmt) *Result {
 	}
 
 	// Serialize row data
-	data, _ := json.Marshal(rowData)
+	data, err := types.SerializeRow(schema, rowData)
+	if err != nil {
+		return &Result{Error: fmt.Errorf("serialize failed: %w", err)}
+	}
 
 	// Create tuple with MVCC info
 	tuple := &types.Tuple{
@@ -261,8 +263,10 @@ func (e *Executor) executeSelect(stmt *SelectStmt) *Result {
 			continue
 		}
 
-		var rowData map[string]types.Value
-		json.Unmarshal(t.Tuple.Data, &rowData)
+		rowData, err := types.DeserializeRow(schema, t.Tuple.Data)
+		if err != nil {
+			continue
+		}
 
 		// Apply WHERE filter
 		if stmt.Where != nil {
@@ -321,8 +325,10 @@ func (e *Executor) executeUpdate(stmt *UpdateStmt) *Result {
 			continue
 		}
 
-		var rowData map[string]types.Value
-		json.Unmarshal(t.Tuple.Data, &rowData)
+		rowData, err := types.DeserializeRow(schema, t.Tuple.Data)
+		if err != nil {
+			continue
+		}
 
 		// Apply WHERE filter
 		if stmt.Where != nil {
@@ -346,7 +352,13 @@ func (e *Executor) executeUpdate(stmt *UpdateStmt) *Result {
 		heap.Update(t.PageID, t.SlotNum, t.Tuple)
 
 		// Create new version
-		newData, _ := json.Marshal(rowData)
+		newData, err := types.SerializeRow(schema, rowData)
+		if err != nil {
+			if autoCommit {
+				e.txnManager.Rollback(txn)
+			}
+			return &Result{Error: fmt.Errorf("serialize failed: %w", err)}
+		}
 		newTuple := &types.Tuple{
 			XMin:    txn.ID,
 			XMax:    types.InvalidTxnID,
@@ -421,8 +433,10 @@ func (e *Executor) executeDelete(stmt *DeleteStmt) *Result {
 			continue
 		}
 
-		var rowData map[string]types.Value
-		json.Unmarshal(t.Tuple.Data, &rowData)
+		rowData, err := types.DeserializeRow(schema, t.Tuple.Data)
+		if err != nil {
+			continue
+		}
 
 		// Apply WHERE filter
 		if stmt.Where != nil {
