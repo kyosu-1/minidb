@@ -88,12 +88,20 @@ func main() {
 			printTables(db)
 			continue
 		case strings.HasPrefix(lower, "create index on "):
-			tableName := strings.TrimPrefix(lower, "create index on ")
-			tableName = strings.TrimSpace(tableName)
-			if err := db.CreateIndex(tableName); err != nil {
+			rest := strings.TrimPrefix(lower, "create index on ")
+			rest = strings.TrimSpace(rest)
+			// Parse: table(column)
+			parenIdx := strings.Index(rest, "(")
+			if parenIdx < 0 || !strings.HasSuffix(rest, ")") {
+				fmt.Println("Usage: create index on <table>(<column>)")
+				continue
+			}
+			tableName := strings.TrimSpace(rest[:parenIdx])
+			columnName := strings.TrimSpace(rest[parenIdx+1 : len(rest)-1])
+			if err := db.CreateIndex(tableName, columnName); err != nil {
 				fmt.Printf("Create index failed: %v\n", err)
 			} else {
-				fmt.Printf("Index created on %s\n", tableName)
+				fmt.Printf("Index created on %s(%s)\n", tableName, columnName)
 			}
 			continue
 		}
@@ -112,7 +120,7 @@ Commands:
   tables, \dt       List all tables
   checkpoint        Create a checkpoint
   vacuum            Remove dead tuples (MVCC garbage collection)
-  create index on <table>  Create B-Tree index
+  create index on <table>(<column>)  Create B-Tree index
   exit, quit        Exit the database
 
 SQL Statements:

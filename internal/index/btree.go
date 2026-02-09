@@ -8,6 +8,27 @@ import (
 	"minidb/pkg/types"
 )
 
+// EncodeKey encodes a Value into a byte slice that preserves sort order under bytes.Compare.
+// INT: sign-bit flip + big-endian so that -1 < 0 < 1 in byte order.
+// TEXT: raw bytes, zero-padded to keySize.
+// BOOL: single byte 0x00/0x01.
+func EncodeKey(val types.Value, keySize int) []byte {
+	key := make([]byte, keySize)
+	switch val.Type {
+	case types.ValueTypeInt:
+		// XOR sign bit so negative values sort before positive
+		u := uint64(val.IntVal) ^ (1 << 63)
+		binary.BigEndian.PutUint64(key[0:8], u)
+	case types.ValueTypeString:
+		copy(key, []byte(val.StrVal))
+	case types.ValueTypeBool:
+		if val.BoolVal {
+			key[0] = 0x01
+		}
+	}
+	return key
+}
+
 const (
 	// B-Tree node layout:
 	// Header: IsLeaf(1) + KeyCount(2) + Reserved(1) = 4 bytes

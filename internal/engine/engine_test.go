@@ -277,7 +277,7 @@ func TestEngineCreateIndex(t *testing.T) {
 	e.Execute("CREATE TABLE users (id INT, name TEXT)")
 	e.Execute("INSERT INTO users VALUES (1, 'alice')")
 
-	if err := e.CreateIndex("users"); err != nil {
+	if err := e.CreateIndex("users", "id"); err != nil {
 		t.Fatalf("CreateIndex() error = %v", err)
 	}
 
@@ -378,7 +378,7 @@ func TestEngineCreateIndexNonExistentTable(t *testing.T) {
 	e := newTestEngine(t)
 	defer e.Close()
 
-	err := e.CreateIndex("nonexistent")
+	err := e.CreateIndex("nonexistent", "id")
 	if err == nil {
 		t.Error("CreateIndex() on non-existent table should error")
 	}
@@ -390,9 +390,9 @@ func TestEngineCreateDuplicateIndex(t *testing.T) {
 
 	e.Execute("CREATE TABLE users (id INT, name TEXT)")
 	e.Execute("INSERT INTO users VALUES (1, 'alice')")
-	e.CreateIndex("users")
+	e.CreateIndex("users", "id")
 
-	err := e.CreateIndex("users")
+	err := e.CreateIndex("users", "id")
 	if err == nil {
 		t.Error("duplicate CreateIndex() should error")
 	}
@@ -613,6 +613,135 @@ func TestEngineVacuumNoDeadTuples(t *testing.T) {
 	}
 	if result.TotalRemoved() != 0 {
 		t.Errorf("TotalRemoved = %d, want 0", result.TotalRemoved())
+	}
+}
+
+func TestEngineCreateIndexInvalidColumn(t *testing.T) {
+	e := newTestEngine(t)
+	defer e.Close()
+
+	e.Execute("CREATE TABLE users (id INT, name TEXT)")
+
+	err := e.CreateIndex("users", "nonexistent")
+	if err == nil {
+		t.Error("CreateIndex() on non-existent column should error")
+	}
+}
+
+func TestEngineIndexLookup(t *testing.T) {
+	e := newTestEngine(t)
+	defer e.Close()
+
+	e.Execute("CREATE TABLE users (id INT, name TEXT)")
+	e.Execute("INSERT INTO users VALUES (1, 'Alice')")
+	e.Execute("INSERT INTO users VALUES (2, 'Bob')")
+	e.Execute("INSERT INTO users VALUES (3, 'Charlie')")
+
+	if err := e.CreateIndex("users", "id"); err != nil {
+		t.Fatalf("CreateIndex() error = %v", err)
+	}
+
+	result := e.Execute("SELECT * FROM users WHERE id = 2")
+	if result.Error != nil {
+		t.Fatalf("SELECT error = %v", result.Error)
+	}
+	if len(result.Rows) != 1 {
+		t.Fatalf("rows = %d, want 1", len(result.Rows))
+	}
+	if result.Rows[0].Values[1].StrVal != "Bob" {
+		t.Errorf("name = %q, want Bob", result.Rows[0].Values[1].StrVal)
+	}
+}
+
+func TestEngineIndexMaintainedOnInsert(t *testing.T) {
+	e := newTestEngine(t)
+	defer e.Close()
+
+	e.Execute("CREATE TABLE users (id INT, name TEXT)")
+	e.Execute("INSERT INTO users VALUES (1, 'Alice')")
+
+	if err := e.CreateIndex("users", "id"); err != nil {
+		t.Fatalf("CreateIndex() error = %v", err)
+	}
+
+	// Insert after index creation
+	e.Execute("INSERT INTO users VALUES (4, 'Dave')")
+
+	result := e.Execute("SELECT * FROM users WHERE id = 4")
+	if result.Error != nil {
+		t.Fatalf("SELECT error = %v", result.Error)
+	}
+	if len(result.Rows) != 1 {
+		t.Fatalf("rows = %d, want 1", len(result.Rows))
+	}
+	if result.Rows[0].Values[1].StrVal != "Dave" {
+		t.Errorf("name = %q, want Dave", result.Rows[0].Values[1].StrVal)
+	}
+}
+
+func TestEngineIndexMaintainedOnUpdate(t *testing.T) {
+	e := newTestEngine(t)
+	defer e.Close()
+
+	e.Execute("CREATE TABLE users (id INT, name TEXT)")
+	e.Execute("INSERT INTO users VALUES (1, 'Alice')")
+	e.Execute("INSERT INTO users VALUES (2, 'Bob')")
+	e.Execute("INSERT INTO users VALUES (3, 'Charlie')")
+
+	if err := e.CreateIndex("users", "id"); err != nil {
+		t.Fatalf("CreateIndex() error = %v", err)
+	}
+
+	e.Execute("UPDATE users SET name = 'Eve' WHERE id = 3")
+
+	result := e.Execute("SELECT * FROM users WHERE id = 3")
+	if result.Error != nil {
+		t.Fatalf("SELECT error = %v", result.Error)
+	}
+	if len(result.Rows) != 1 {
+		t.Fatalf("rows = %d, want 1", len(result.Rows))
+	}
+	if result.Rows[0].Values[1].StrVal != "Eve" {
+		t.Errorf("name = %q, want Eve", result.Rows[0].Values[1].StrVal)
+	}
+}
+
+func TestEngineIndexAfterVacuum(t *testing.T) {
+	e := newTestEngine(t)
+	defer e.Close()
+
+	e.Execute("CREATE TABLE users (id INT, name TEXT)")
+	e.Execute("INSERT INTO users VALUES (1, 'Alice')")
+	e.Execute("INSERT INTO users VALUES (2, 'Bob')")
+	e.Execute("INSERT INTO users VALUES (3, 'Charlie')")
+
+	if err := e.CreateIndex("users", "id"); err != nil {
+		t.Fatalf("CreateIndex() error = %v", err)
+	}
+
+	e.Execute("DELETE FROM users WHERE id = 1")
+
+	_, err := e.Vacuum()
+	if err != nil {
+		t.Fatalf("Vacuum() error = %v", err)
+	}
+
+	// Deleted row should not be found
+	result := e.Execute("SELECT * FROM users WHERE id = 1")
+	if result.Error != nil {
+		t.Fatalf("SELECT error = %v", result.Error)
+	}
+	if len(result.Rows) != 0 {
+		t.Errorf("rows for deleted id=1 = %d, want 0", len(result.Rows))
+	}
+
+	// Existing row should still be found
+	result = e.Execute("SELECT * FROM users WHERE id = 2")
+	if result.Error != nil {
+		t.Fatalf("SELECT error = %v", result.Error)
+	}
+	if len(result.Rows) != 1 {
+		t.Errorf("rows for id=2 = %d, want 1", len(result.Rows))
 	}
 }
 

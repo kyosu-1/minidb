@@ -2,6 +2,7 @@ package sql
 
 import (
 	"fmt"
+	"minidb/internal/index"
 	"minidb/internal/storage"
 	"minidb/internal/txn"
 	"minidb/internal/wal"
@@ -16,6 +17,9 @@ type Executor struct {
 	// Disk-based storage
 	catalog    *storage.Catalog
 	bufferPool *storage.BufferPool
+
+	// Indexes
+	indexes map[uint32]*index.BTree // tableID -> index
 
 	// Current transaction (for REPL mode)
 	currentTxn *txn.Transaction
@@ -41,6 +45,11 @@ func NewExecutor(txnManager *txn.Manager, walWriter *wal.Writer) *Executor {
 func (e *Executor) SetStorage(catalog *storage.Catalog, bufferPool *storage.BufferPool) {
 	e.catalog = catalog
 	e.bufferPool = bufferPool
+}
+
+// SetIndexes sets the index references from the engine.
+func (e *Executor) SetIndexes(indexes map[uint32]*index.BTree) {
+	e.indexes = indexes
 }
 
 // Execute executes a SQL statement.
@@ -213,6 +222,17 @@ func (e *Executor) executeInsert(stmt *InsertStmt) *Result {
 		}
 	}
 
+	// Update index if exists
+	if bt, ok := e.indexes[tableID]; ok {
+		if colName, ok := e.catalog.GetIndexColumn(tableID); ok {
+			if val, ok := rowData[colName]; ok {
+				key := index.EncodeKey(val, 64)
+				rid := index.RID{PageID: pageID, SlotNum: slotNum, TableID: tableID}
+				bt.Insert(key, rid)
+			}
+		}
+	}
+
 	if autoCommit {
 		e.txnManager.Commit(txn)
 		if e.bufferPool != nil {
@@ -239,12 +259,6 @@ func (e *Executor) executeSelect(stmt *SelectStmt) *Result {
 	// Get or create transaction
 	txn, autoCommit := e.getTransaction()
 
-	// Scan heap from disk
-	tuples, err := heap.Scan()
-	if err != nil {
-		return &Result{Error: fmt.Errorf("scan failed: %w", err)}
-	}
-
 	result := &Result{}
 
 	// Determine columns
@@ -256,35 +270,58 @@ func (e *Executor) executeSelect(stmt *SelectStmt) *Result {
 		result.Columns = stmt.Columns
 	}
 
-	// Process tuples
-	for _, t := range tuples {
-		// Check MVCC visibility
-		if !txn.Snapshot.IsVisible(t.Tuple) {
-			continue
+	// Try index lookup for WHERE column = literal
+	indexUsed := false
+	if stmt.Where != nil {
+		if rows, ok := e.tryIndexLookup(tableID, schema, heap, stmt.Where, txn); ok {
+			for _, rowData := range rows {
+				row := types.Row{Values: make([]types.Value, len(result.Columns))}
+				for i, colName := range result.Columns {
+					if val, ok := rowData[colName]; ok {
+						row.Values[i] = val
+					} else {
+						row.Values[i] = types.Value{IsNull: true}
+					}
+				}
+				result.Rows = append(result.Rows, row)
+			}
+			indexUsed = true
 		}
+	}
 
-		rowData, err := types.DeserializeRow(schema, t.Tuple.Data)
+	// Fall back to full scan
+	if !indexUsed {
+		tuples, err := heap.Scan()
 		if err != nil {
-			continue
+			return &Result{Error: fmt.Errorf("scan failed: %w", err)}
 		}
 
-		// Apply WHERE filter
-		if stmt.Where != nil {
-			if !e.evaluateCondition(stmt.Where, rowData) {
+		for _, t := range tuples {
+			if !txn.Snapshot.IsVisible(t.Tuple) {
 				continue
 			}
-		}
 
-		// Build row
-		row := types.Row{Values: make([]types.Value, len(result.Columns))}
-		for i, colName := range result.Columns {
-			if val, ok := rowData[colName]; ok {
-				row.Values[i] = val
-			} else {
-				row.Values[i] = types.Value{IsNull: true}
+			rowData, err := types.DeserializeRow(schema, t.Tuple.Data)
+			if err != nil {
+				continue
 			}
+
+			if stmt.Where != nil {
+				if !e.evaluateCondition(stmt.Where, rowData) {
+					continue
+				}
+			}
+
+			row := types.Row{Values: make([]types.Value, len(result.Columns))}
+			for i, colName := range result.Columns {
+				if val, ok := rowData[colName]; ok {
+					row.Values[i] = val
+				} else {
+					row.Values[i] = types.Value{IsNull: true}
+				}
+			}
+			result.Rows = append(result.Rows, row)
 		}
-		result.Rows = append(result.Rows, row)
 	}
 
 	if autoCommit {
@@ -387,6 +424,17 @@ func (e *Executor) executeUpdate(stmt *UpdateStmt) *Result {
 				if p, err := e.bufferPool.FetchPage(newPageID); err == nil {
 					p.SetLSN(lsn)
 					e.bufferPool.UnpinPage(newPageID, true)
+				}
+			}
+		}
+
+		// Update index if exists
+		if bt, ok := e.indexes[tableID]; ok {
+			if colName, ok := e.catalog.GetIndexColumn(tableID); ok {
+				if val, ok := rowData[colName]; ok {
+					key := index.EncodeKey(val, 64)
+					rid := index.RID{PageID: newPageID, SlotNum: newSlotNum, TableID: tableID}
+					bt.Insert(key, rid)
 				}
 			}
 		}
@@ -573,6 +621,56 @@ func (e *Executor) compareLess(left, right types.Value) bool {
 	default:
 		return false
 	}
+}
+
+// tryIndexLookup attempts to use an index for a WHERE column = literal expression.
+// Returns the matching rows and true if the index was used, or nil and false otherwise.
+func (e *Executor) tryIndexLookup(tableID uint32, schema *types.Schema, heap *storage.TableHeap, where Expr, txn *txn.Transaction) ([]map[string]types.Value, bool) {
+	bt, ok := e.indexes[tableID]
+	if !ok {
+		return nil, false
+	}
+
+	colName, ok := e.catalog.GetIndexColumn(tableID)
+	if !ok {
+		return nil, false
+	}
+
+	// Check if WHERE is column = literal
+	binExpr, ok := where.(*BinaryExpr)
+	if !ok || binExpr.Op != TokenEq {
+		return nil, false
+	}
+
+	colExpr, okCol := binExpr.Left.(*ColumnExpr)
+	litExpr, okLit := binExpr.Right.(*LiteralExpr)
+	if !okCol || !okLit || colExpr.Name != colName {
+		return nil, false
+	}
+
+	key := index.EncodeKey(litExpr.Value, 64)
+	rid, found := bt.Search(key)
+	if !found {
+		return nil, true // index used, no results
+	}
+
+	// Fetch tuple by RID
+	tuple, err := heap.Get(rid.PageID, rid.SlotNum)
+	if err != nil {
+		return nil, false // fallback to scan
+	}
+
+	// MVCC visibility check
+	if !txn.Snapshot.IsVisible(tuple) {
+		return nil, false // stale index entry, fallback to scan
+	}
+
+	rowData, err := types.DeserializeRow(schema, tuple.Data)
+	if err != nil {
+		return nil, false
+	}
+
+	return []map[string]types.Value{rowData}, true
 }
 
 // HasTransaction returns true if there's an active transaction.

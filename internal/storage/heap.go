@@ -210,6 +210,7 @@ type Catalog struct {
 	tableIDs     map[string]uint32
 	nextTableID  uint32
 	indexRoots   map[uint32]types.PageID // tableID -> B-Tree root
+	indexColumns map[uint32]string       // tableID -> column name
 }
 
 // CatalogEntry represents a serialized catalog entry.
@@ -231,30 +232,32 @@ func NewCatalog(bufferPool *BufferPool) (*Catalog, error) {
 	}
 	
 	c := &Catalog{
-		bufferPool:  bufferPool,
-		catalogPage: page.ID,
-		schemas:     make(map[string]*types.Schema),
-		tableHeaps:  make(map[uint32]*TableHeap),
-		tableIDs:    make(map[string]uint32),
-		nextTableID: 1,
-		indexRoots:  make(map[uint32]types.PageID),
+		bufferPool:   bufferPool,
+		catalogPage:  page.ID,
+		schemas:      make(map[string]*types.Schema),
+		tableHeaps:   make(map[uint32]*TableHeap),
+		tableIDs:     make(map[string]uint32),
+		nextTableID:  1,
+		indexRoots:   make(map[uint32]types.PageID),
+		indexColumns: make(map[uint32]string),
 	}
-	
+
 	bufferPool.UnpinPage(page.ID, true)
-	
+
 	return c, nil
 }
 
 // LoadCatalog loads the catalog from disk.
 func LoadCatalog(bufferPool *BufferPool, catalogPageID types.PageID) (*Catalog, error) {
 	c := &Catalog{
-		bufferPool:  bufferPool,
-		catalogPage: catalogPageID,
-		schemas:     make(map[string]*types.Schema),
-		tableHeaps:  make(map[uint32]*TableHeap),
-		tableIDs:    make(map[string]uint32),
-		nextTableID: 1,
-		indexRoots:  make(map[uint32]types.PageID),
+		bufferPool:   bufferPool,
+		catalogPage:  catalogPageID,
+		schemas:      make(map[string]*types.Schema),
+		tableHeaps:   make(map[uint32]*TableHeap),
+		tableIDs:     make(map[string]uint32),
+		nextTableID:  1,
+		indexRoots:   make(map[uint32]types.PageID),
+		indexColumns: make(map[uint32]string),
 	}
 	
 	// Read catalog page
@@ -311,10 +314,17 @@ func (c *Catalog) GetTableHeap(tableID uint32) *TableHeap {
 	return c.tableHeaps[tableID]
 }
 
-// SetIndexRoot sets the B-Tree root for a table.
-func (c *Catalog) SetIndexRoot(tableID uint32, rootPageID types.PageID) {
+// SetIndexRoot sets the B-Tree root and indexed column for a table.
+func (c *Catalog) SetIndexRoot(tableID uint32, rootPageID types.PageID, columnName string) {
 	c.indexRoots[tableID] = rootPageID
+	c.indexColumns[tableID] = columnName
 	c.serialize()
+}
+
+// GetIndexColumn returns the indexed column name for a table.
+func (c *Catalog) GetIndexColumn(tableID uint32) (string, bool) {
+	col, ok := c.indexColumns[tableID]
+	return col, ok
 }
 
 // GetIndexRoot returns the B-Tree root for a table.
@@ -380,7 +390,15 @@ func (c *Catalog) serialize() {
 		// Index root
 		binary.LittleEndian.PutUint32(page.Data[offset:], uint32(indexRoot))
 		offset += 4
-		
+
+		// Index column name
+		indexCol := c.indexColumns[tableID]
+		indexColBytes := []byte(indexCol)
+		binary.LittleEndian.PutUint16(page.Data[offset:], uint16(len(indexColBytes)))
+		offset += 2
+		copy(page.Data[offset:], indexColBytes)
+		offset += len(indexColBytes)
+
 		// Number of columns
 		binary.LittleEndian.PutUint16(page.Data[offset:], uint16(len(schema.Columns)))
 		offset += 2
@@ -444,7 +462,13 @@ func (c *Catalog) deserialize(page *Page) {
 		// Index root
 		indexRoot := types.PageID(binary.LittleEndian.Uint32(page.Data[offset:]))
 		offset += 4
-		
+
+		// Index column name
+		indexColLen := binary.LittleEndian.Uint16(page.Data[offset:])
+		offset += 2
+		indexCol := string(page.Data[offset : offset+int(indexColLen)])
+		offset += int(indexColLen)
+
 		// Number of columns
 		numCols := binary.LittleEndian.Uint16(page.Data[offset:])
 		offset += 2
@@ -487,6 +511,7 @@ func (c *Catalog) deserialize(page *Page) {
 		c.tableIDs[tableName] = tableID
 		if indexRoot != types.InvalidPageID {
 			c.indexRoots[tableID] = indexRoot
+			c.indexColumns[tableID] = indexCol
 		}
 	}
 }

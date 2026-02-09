@@ -6,7 +6,7 @@
 - **WAL (Write-Ahead Logging)** - クラッシュリカバリのためのログ先行書き込み
 - **ARIES Recovery** - 3フェーズリカバリ（Analysis → Redo → Undo）
 - **MVCC** - スナップショット分離による並行制御
-- **B-Treeインデックス** - 高速検索
+- **B-Treeインデックス** - カラム値ベースのキー、自動メンテナンス、SELECT WHERE最適化
 - **SQLパーサー** - CREATE, INSERT, SELECT, UPDATE, DELETE
 - **VACUUM** - MVCCデッドタプルのガベージコレクション
 
@@ -160,7 +160,48 @@ DELETE 1
 minidb> vacuum
 VACUUM: removed 1 dead tuples.
   users: scanned 2, removed 1
+```
 
+### インデックスの利用
+
+```sql
+minidb> CREATE TABLE products (id INT, name TEXT)
+minidb> INSERT INTO products VALUES (1, 'Apple')
+minidb> INSERT INTO products VALUES (2, 'Banana')
+minidb> INSERT INTO products VALUES (3, 'Cherry')
+
+-- カラム値ベースのインデックスを作成
+minidb> create index on products(id)
+Index created on products(id)
+
+-- インデックス経由の高速検索（フルスキャンではなくB-Tree探索）
+minidb> SELECT * FROM products WHERE id = 2
+├────┼────────┤
+│ id │ name   │
+├────┼────────┤
+│ 2  │ Banana │
+├────┼────────┤
+SELECT 1 rows
+
+-- INSERT/UPDATE後もインデックスは自動メンテナンスされる
+minidb> INSERT INTO products VALUES (4, 'Date')
+minidb> SELECT * FROM products WHERE id = 4
+├────┼──────┤
+│ id │ name │
+├────┼──────┤
+│ 4  │ Date │
+├────┼──────┤
+SELECT 1 rows
+
+-- VACUUM後はインデックスが再構築される
+minidb> DELETE FROM products WHERE id = 1
+minidb> vacuum
+VACUUM: removed 1 dead tuples.
+```
+
+### 統計情報
+
+```sql
 minidb> stats
 ╔══════════════════════════════════════════╗
 ║         Database Statistics              ║
@@ -290,8 +331,10 @@ func (s *Snapshot) IsVisible(tuple *Tuple) bool {
            /   |   \
       [10|20] [40|50] [70|80]    ← リーフノード
          ↓      ↓       ↓
-       RIDs   RIDs    RIDs      ← 行位置
+       RIDs   RIDs    RIDs      ← 行位置（PageID + SlotNum）
 ```
+
+カラム値をソート順保持エンコーディングでキー化し、`SELECT ... WHERE col = val` でインデックス探索を行う。INSERT/UPDATE 時にインデックスは自動メンテナンスされ、VACUUM 時に再構築される。
 
 ### 6. ARIESリカバリ (`wal/recovery.go`) — [詳細](docs/wal-and-recovery.md#6-aries-3-フェーズリカバリ)
 
@@ -359,7 +402,8 @@ Phase 3: Undo
 | 並列スキャン | 複数スレッドでのテーブルスキャン |
 | クエリオプティマイザ | 実行計画の最適化 |
 | JOIN | 複数テーブルの結合 |
-| セカンダリインデックス | 任意カラムへのインデックス |
+| 複合インデックス | 複数カラムにまたがるインデックス |
+| 非ユニークインデックス | 重複キーのサポート（現在は同一キーで上書き） |
 
 ---
 

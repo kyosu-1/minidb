@@ -119,6 +119,9 @@ func New(cfg Config) (*Engine, error) {
 	// Load existing indexes
 	e.loadIndexes()
 
+	// Share indexes with executor
+	e.executor.SetIndexes(e.indexes)
+
 	// Perform recovery if needed
 	if err := e.recover(); err != nil {
 		e.Close()
@@ -318,8 +321,8 @@ func (e *Engine) Execute(sqlStr string) *sql.Result {
 	return e.executor.Execute(sqlStr)
 }
 
-// CreateIndex creates a B-Tree index on a table's primary key.
-func (e *Engine) CreateIndex(tableName string) error {
+// CreateIndex creates a B-Tree index on the specified column.
+func (e *Engine) CreateIndex(tableName, columnName string) error {
 	tableID, ok := e.catalog.GetTableID(tableName)
 	if !ok {
 		return fmt.Errorf("table %s not found", tableName)
@@ -328,6 +331,19 @@ func (e *Engine) CreateIndex(tableName string) error {
 	// Check if index already exists
 	if _, exists := e.indexes[tableID]; exists {
 		return fmt.Errorf("index already exists for table %s", tableName)
+	}
+
+	// Verify column exists
+	schema := e.catalog.GetSchema(tableName)
+	columnFound := false
+	for _, col := range schema.Columns {
+		if col.Name == columnName {
+			columnFound = true
+			break
+		}
+	}
+	if !columnFound {
+		return fmt.Errorf("column %s not found in table %s", columnName, tableName)
 	}
 
 	// Create B-Tree
@@ -344,13 +360,22 @@ func (e *Engine) CreateIndex(tableName string) error {
 	}
 
 	for _, t := range tuples {
-		// Use RowID as key for now
-		key := make([]byte, 8)
-		key[0] = byte(t.Tuple.RowID)
-		key[1] = byte(t.Tuple.RowID >> 8)
-		key[2] = byte(t.Tuple.RowID >> 16)
-		key[3] = byte(t.Tuple.RowID >> 24)
+		// Skip dead tuples
+		if t.Tuple.IsDeleted() {
+			continue
+		}
 
+		rowData, err := types.DeserializeRow(schema, t.Tuple.Data)
+		if err != nil {
+			continue
+		}
+
+		val, ok := rowData[columnName]
+		if !ok {
+			continue
+		}
+
+		key := index.EncodeKey(val, 64)
 		rid := index.RID{
 			PageID:  t.PageID,
 			SlotNum: t.SlotNum,
@@ -361,7 +386,7 @@ func (e *Engine) CreateIndex(tableName string) error {
 	}
 
 	e.indexes[tableID] = btree
-	e.catalog.SetIndexRoot(tableID, btree.GetRootPageID())
+	e.catalog.SetIndexRoot(tableID, btree.GetRootPageID(), columnName)
 
 	return nil
 }
@@ -507,6 +532,54 @@ func (e *Engine) Vacuum() (*VacuumResult, error) {
 		}
 
 		result.Tables = append(result.Tables, stats)
+	}
+
+	// Rebuild indexes for tables that have them
+	for _, tableName := range e.catalog.GetAllTables() {
+		tableID, ok := e.catalog.GetTableID(tableName)
+		if !ok {
+			continue
+		}
+		if _, exists := e.indexes[tableID]; !exists {
+			continue
+		}
+		colName, ok := e.catalog.GetIndexColumn(tableID)
+		if !ok {
+			continue
+		}
+
+		schema := e.catalog.GetSchema(tableName)
+		heap := e.catalog.GetTableHeap(tableID)
+
+		newBtree, err := index.NewBTree(e.bufferPool, 64)
+		if err != nil {
+			return nil, fmt.Errorf("vacuum rebuild index %s: %w", tableName, err)
+		}
+
+		tuples, err := heap.Scan()
+		if err != nil {
+			return nil, fmt.Errorf("vacuum rescan %s: %w", tableName, err)
+		}
+
+		for _, t := range tuples {
+			if t.Tuple.IsDeleted() {
+				continue
+			}
+			rowData, err := types.DeserializeRow(schema, t.Tuple.Data)
+			if err != nil {
+				continue
+			}
+			val, ok := rowData[colName]
+			if !ok {
+				continue
+			}
+			key := index.EncodeKey(val, 64)
+			rid := index.RID{PageID: t.PageID, SlotNum: t.SlotNum, TableID: tableID}
+			newBtree.Insert(key, rid)
+		}
+
+		e.indexes[tableID] = newBtree
+		e.catalog.SetIndexRoot(tableID, newBtree.GetRootPageID(), colName)
 	}
 
 	// Flush all modified pages

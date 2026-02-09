@@ -1,8 +1,8 @@
 # B-Tree インデックス
 
-テーブルのキーに対する高速な検索を提供するツリー構造のインデックス。ディスクベースのデータベースに最適な自己平衡型の探索木。
+テーブルのカラム値に対する高速な検索を提供するツリー構造のインデックス。ディスクベースのデータベースに最適な自己平衡型の探索木。
 
-対応ソース: `internal/index/btree.go`
+対応ソース: `internal/index/btree.go`, `internal/sql/executor.go`（インデックス活用）, `internal/engine/engine.go`（作成・再構築）
 
 ---
 
@@ -125,6 +125,40 @@ func (bt *BTree) normalizeKey(key []byte) []byte {
 }
 ```
 
+### カラム値のキーエンコーディング
+
+`EncodeKey` はカラム値を `bytes.Compare` で正しいソート順を保つバイト列に変換する：
+
+| 型 | エンコーディング | 備考 |
+|---|---|---|
+| INT | 符号ビット XOR 反転 + big-endian 8 バイト | `-1 < 0 < 1` のバイト順序を保証 |
+| TEXT | raw bytes + ゼロパディング | 辞書順で比較可能 |
+| BOOL | 1 バイト（0x00 / 0x01） | false < true |
+
+```go
+func EncodeKey(val types.Value, keySize int) []byte {
+    key := make([]byte, keySize)
+    switch val.Type {
+    case types.ValueTypeInt:
+        u := uint64(val.IntVal) ^ (1 << 63)  // 符号ビット反転
+        binary.BigEndian.PutUint64(key[0:8], u)
+    case types.ValueTypeString:
+        copy(key, []byte(val.StrVal))
+    case types.ValueTypeBool:
+        if val.BoolVal { key[0] = 0x01 }
+    }
+    return key
+}
+```
+
+INT エンコーディングの例：
+```
+-1 → 0x7FFFFFFFFFFFFFFF  (符号ビット反転)
+ 0 → 0x8000000000000000
+ 1 → 0x8000000000000001
+→ bytes.Compare で正しい順序
+```
+
 ---
 
 ## 4. 挿入とリーフ分割
@@ -240,3 +274,57 @@ func (bt *BTree) scanNode(pageID, results) {
 検索例: `key = 45`
 1. ルート: `30 ≤ 45 < 60` → Child₁ へ
 2. リーフ `[40|50]`: `40` と `50` を比較 → `45` は見つからない
+
+---
+
+## 8. インデックスの作成と利用
+
+### インデックス作成
+
+`create index on <table>(<column>)` で指定カラムにインデックスを作成する。
+
+```mermaid
+flowchart TD
+    A["CreateIndex(table, column)"] --> B["カラムの存在を検証"]
+    B --> C["新しい B-Tree を作成"]
+    C --> D["テーブルの全タプルをスキャン"]
+    D --> E{"dead tuple?<br/>XMax ≠ 0"}
+    E -- Yes --> F[スキップ]
+    E -- No --> G["EncodeKey(カラム値) → key"]
+    G --> H["btree.Insert(key, RID)"]
+    H --> D
+    D --> I["カタログにインデックスルート<br/>とカラム名を保存"]
+```
+
+### SELECT での活用
+
+WHERE 句が `column = literal` かつそのカラムにインデックスがある場合、フルスキャンの代わりに B-Tree 探索を行う：
+
+```mermaid
+flowchart TD
+    A["SELECT WHERE col = val"] --> B{"インデックスあり?<br/>col = indexed column?"}
+    B -- No --> C["フルスキャン"]
+    B -- Yes --> D["EncodeKey(val) → key"]
+    D --> E["btree.Search(key)"]
+    E --> F{見つかった?}
+    F -- No --> G["0 rows を返す"]
+    F -- Yes --> H["heap.Get(RID) でタプル取得"]
+    H --> I{"MVCC 可視?"}
+    I -- Yes --> J["結果を返す"]
+    I -- No --> K["フルスキャンに<br/>フォールバック"]
+```
+
+### DML 操作時の自動メンテナンス
+
+| 操作 | インデックス処理 | 理由 |
+|------|-----------------|------|
+| INSERT | `btree.Insert(key, rid)` | 新タプルをインデックスに追加 |
+| UPDATE | `btree.Insert(newKey, newRid)` | 新バージョンでインデックスを更新 |
+| DELETE | 何もしない | MVCC 可視性チェックで除外される |
+| VACUUM | インデックス再構築 | dead tuple 削除後、生存タプルで再構築 |
+
+### 制約事項
+
+- **ユニークキー前提**: 同一キーで `Insert` すると RID が上書きされる。非ユニークカラムでは最新の INSERT のみインデックスで見つかる
+- **VACUUM 時の旧ページ**: 再構築時に旧 B-Tree ページは孤立する（free-list 未実装）
+- **1テーブル1インデックス**: 現在は各テーブルに1つのインデックスのみ対応

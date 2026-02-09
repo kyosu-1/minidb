@@ -275,7 +275,7 @@ func TestCatalogIndexRoot(t *testing.T) {
 	}
 
 	// Set index root
-	catalog.SetIndexRoot(tableID, types.PageID(42))
+	catalog.SetIndexRoot(tableID, types.PageID(42), "id")
 
 	root, ok := catalog.GetIndexRoot(tableID)
 	if !ok {

@@ -215,6 +215,30 @@ func TestGetRootPageID(t *testing.T) {
 	}
 }
 
+func TestEncodeKeyIntOrdering(t *testing.T) {
+	vals := []int64{-100, -1, 0, 1, 100, 1000}
+	var prev []byte
+	for _, v := range vals {
+		key := EncodeKey(types.Value{Type: types.ValueTypeInt, IntVal: v}, 64)
+		if prev != nil && bytes.Compare(prev, key) >= 0 {
+			t.Errorf("EncodeKey(%d) should be > EncodeKey of previous value, but byte order is wrong", v)
+		}
+		prev = key
+	}
+}
+
+func TestEncodeKeyStringOrdering(t *testing.T) {
+	vals := []string{"alice", "bob", "charlie"}
+	var prev []byte
+	for _, v := range vals {
+		key := EncodeKey(types.Value{Type: types.ValueTypeString, StrVal: v}, 64)
+		if prev != nil && bytes.Compare(prev, key) >= 0 {
+			t.Errorf("EncodeKey(%q) should be > EncodeKey of previous value", v)
+		}
+		prev = key
+	}
+}
+
 func TestNormalizeKey(t *testing.T) {
 	bt := newTestBTree(t, 8)
 
