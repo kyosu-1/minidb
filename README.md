@@ -173,9 +173,23 @@ minidb> stats
 
 ---
 
+## 詳細ドキュメント
+
+各コンポーネントの理論背景と実装の詳細は [`docs/`](docs/) にまとめています。
+
+| ドキュメント | 内容 |
+|---|---|
+| [ストレージエンジン](docs/storage.md) | スロットページ、ディスクマネージャ、バッファプール、テーブルヒープ、カタログ |
+| [WAL と ARIES リカバリ](docs/wal-and-recovery.md) | Write-Ahead Logging のプロトコル、ログレコード形式、ARIES 3 フェーズリカバリ |
+| [トランザクションと MVCC](docs/transactions-and-mvcc.md) | トランザクション管理、スナップショット分離、MVCC 可視性ルール |
+| [B-Tree インデックス](docs/btree-index.md) | B-Tree の基礎、ノードフォーマット、検索・挿入・分割アルゴリズム |
+| [SQL パーサーと実行エンジン](docs/sql.md) | 字句解析、再帰下降パーサー、各 SQL 文の実行フロー |
+
+---
+
 ## 主要コンポーネントの解説
 
-### 1. ページ構造 (`storage/page.go`)
+### 1. ページ構造 (`storage/page.go`) — [詳細](docs/storage.md)
 
 ```
 ┌────────────────────────────────────────┐
@@ -198,7 +212,7 @@ minidb> stats
 
 ヒープページは `NextPageID` フィールドによりリンクリストで連結されます（連続ページ番号を仮定しません）。
 
-### 2. バッファプール (`storage/buffer.go`)
+### 2. バッファプール (`storage/buffer.go`) — [詳細](docs/storage.md#3-バッファプール)
 
 ```go
 type BufferPool struct {
@@ -222,7 +236,7 @@ func (bp *BufferPool) FetchPage(pageID) (*Page, error) {
 }
 ```
 
-### 3. WAL書き込み (`wal/writer.go`)
+### 3. WAL書き込み (`wal/writer.go`) — [詳細](docs/wal-and-recovery.md)
 
 ```go
 // コミット時の処理
@@ -238,7 +252,7 @@ func (w *Writer) LogCommit(txnID) (LSN, error) {
 }
 ```
 
-### 4. MVCC可視性 (`txn/mvcc.go`)
+### 4. MVCC可視性 (`txn/mvcc.go`) — [詳細](docs/transactions-and-mvcc.md)
 
 ```go
 func (s *Snapshot) IsVisible(tuple *Tuple) bool {
@@ -261,7 +275,7 @@ func (s *Snapshot) IsVisible(tuple *Tuple) bool {
 }
 ```
 
-### 5. B-Treeインデックス (`index/btree.go`)
+### 5. B-Treeインデックス (`index/btree.go`) — [詳細](docs/btree-index.md)
 
 ```
             [30|60]              ← 内部ノード
@@ -271,7 +285,7 @@ func (s *Snapshot) IsVisible(tuple *Tuple) bool {
        RIDs   RIDs    RIDs      ← 行位置
 ```
 
-### 6. ARIESリカバリ (`wal/recovery.go`)
+### 6. ARIESリカバリ (`wal/recovery.go`) — [詳細](docs/wal-and-recovery.md#6-aries-3-フェーズリカバリ)
 
 ```
 Phase 1: Analysis
