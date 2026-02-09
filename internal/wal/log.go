@@ -15,7 +15,9 @@ type LogRecord struct {
 	Type      types.LogRecordType
 	TableID   uint32
 	RowID     uint64
-	
+	PageID    types.PageID
+	SlotNum   uint16
+
 	// For UPDATE/INSERT/DELETE
 	BeforeImage []byte // Old value (for UNDO)
 	AfterImage  []byte // New value (for REDO)
@@ -28,8 +30,8 @@ type LogRecord struct {
 	UndoNextLSN types.LSN
 }
 
-// Header size: LSN(8) + PrevLSN(8) + TxnID(8) + Type(1) + TableID(4) + RowID(8) + BeforeLen(4) + AfterLen(4)
-const logRecordHeaderSize = 45
+// Header size: LSN(8) + PrevLSN(8) + TxnID(8) + Type(1) + TableID(4) + RowID(8) + PageID(4) + SlotNum(2) + BeforeLen(4) + AfterLen(4)
+const logRecordHeaderSize = 51
 
 // Serialize converts the log record to bytes.
 func (r *LogRecord) Serialize() []byte {
@@ -67,6 +69,10 @@ func (r *LogRecord) Serialize() []byte {
 	offset += 4
 	binary.LittleEndian.PutUint64(buf[offset:], r.RowID)
 	offset += 8
+	binary.LittleEndian.PutUint32(buf[offset:], uint32(r.PageID))
+	offset += 4
+	binary.LittleEndian.PutUint16(buf[offset:], r.SlotNum)
+	offset += 2
 	binary.LittleEndian.PutUint32(buf[offset:], uint32(beforeLen))
 	offset += 4
 	binary.LittleEndian.PutUint32(buf[offset:], uint32(afterLen))
@@ -140,6 +146,10 @@ func Deserialize(buf []byte) (*LogRecord, int, error) {
 	offset += 4
 	r.RowID = binary.LittleEndian.Uint64(buf[offset:])
 	offset += 8
+	r.PageID = types.PageID(binary.LittleEndian.Uint32(buf[offset:]))
+	offset += 4
+	r.SlotNum = binary.LittleEndian.Uint16(buf[offset:])
+	offset += 2
 	beforeLen := binary.LittleEndian.Uint32(buf[offset:])
 	offset += 4
 	afterLen := binary.LittleEndian.Uint32(buf[offset:])

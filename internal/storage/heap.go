@@ -70,15 +70,16 @@ func (th *TableHeap) Insert(tuple *types.Tuple) (types.PageID, uint16, error) {
 	}
 	
 	// Page is full, allocate new page
-	th.bufferPool.UnpinPage(page.ID, false)
-	
 	newPage, err := th.bufferPool.NewPage(PageTypeData)
 	if err != nil {
+		th.bufferPool.UnpinPage(page.ID, false)
 		return 0, 0, err
 	}
-	
-	// Link pages (store next page ID in header reserved area)
-	// For simplicity, we just track first/last
+
+	// Link old last page to new page
+	page.SetNextPageID(newPage.ID)
+	th.bufferPool.UnpinPage(page.ID, true)
+
 	th.lastPage = newPage.ID
 	
 	slotNum, err = newPage.InsertTuple(data)
@@ -159,13 +160,11 @@ func (th *TableHeap) Scan() ([]*TupleWithRID, error) {
 			})
 		}
 		
+		nextPageID := page.GetNextPageID()
 		th.bufferPool.UnpinPage(currentPageID, false)
-		
-		// Move to next page
-		if currentPageID == th.lastPage {
-			break
-		}
-		currentPageID++
+
+		// Move to next page via linked list
+		currentPageID = nextPageID
 	}
 	
 	return results, nil
@@ -356,7 +355,10 @@ func (c *Catalog) serialize() {
 	for tableName, schema := range c.schemas {
 		tableID := c.tableIDs[tableName]
 		heap := c.tableHeaps[tableID]
-		indexRoot := c.indexRoots[tableID]
+		indexRoot, ok := c.indexRoots[tableID]
+		if !ok {
+			indexRoot = types.InvalidPageID
+		}
 		
 		// Table ID
 		binary.LittleEndian.PutUint32(page.Data[offset:], tableID)

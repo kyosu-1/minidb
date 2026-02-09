@@ -91,13 +91,13 @@ func (e *Executor) executeCommit() *Result {
 	}
 	txnID := e.currentTxn.ID
 
-	// Flush dirty pages
-	if e.bufferPool != nil {
-		e.bufferPool.FlushAllPages()
-	}
-
+	// Commit WAL first (for durability), then flush pages
 	if err := e.txnManager.Commit(e.currentTxn); err != nil {
 		return &Result{Error: err}
+	}
+
+	if e.bufferPool != nil {
+		e.bufferPool.FlushAllPages()
 	}
 	e.currentTxn = nil
 	return &Result{Message: fmt.Sprintf("COMMIT (txn %d)", txnID)}
@@ -205,19 +205,23 @@ func (e *Executor) executeInsert(stmt *InsertStmt) *Result {
 
 	tuple.RowID = uint64(pageID)<<16 | uint64(slotNum)
 
-	// Also track in MVCC store for visibility
-	e.mvccStore.RestoreTuple(tuple)
-
 	// Log to WAL
 	if e.walWriter != nil {
-		e.walWriter.LogInsert(txn.ID, tableID, tuple.RowID, tuple.Serialize())
+		lsn := e.walWriter.LogInsert(txn.ID, tableID, tuple.RowID, pageID, slotNum, tuple.Serialize())
+		// Set page LSN
+		if e.bufferPool != nil {
+			if p, err := e.bufferPool.FetchPage(pageID); err == nil {
+				p.SetLSN(lsn)
+				e.bufferPool.UnpinPage(pageID, true)
+			}
+		}
 	}
 
 	if autoCommit {
+		e.txnManager.Commit(txn)
 		if e.bufferPool != nil {
 			e.bufferPool.FlushAllPages()
 		}
-		e.txnManager.Commit(txn)
 	}
 
 	return &Result{Message: fmt.Sprintf("INSERT 1 (page=%d, slot=%d)", pageID, slotNum)}
@@ -344,6 +348,9 @@ func (e *Executor) executeUpdate(stmt *UpdateStmt) *Result {
 		// Mark old version as deleted
 		t.Tuple.XMax = txn.ID
 
+		// Write back old tuple's XMax to disk
+		heap.Update(t.PageID, t.SlotNum, t.Tuple)
+
 		// Create new version
 		newData, _ := json.Marshal(rowData)
 		newTuple := &types.Tuple{
@@ -356,7 +363,7 @@ func (e *Executor) executeUpdate(stmt *UpdateStmt) *Result {
 		}
 
 		// Update on disk (insert new version)
-		pageID, slotNum, err := heap.Insert(newTuple)
+		newPageID, newSlotNum, err := heap.Insert(newTuple)
 		if err != nil {
 			if autoCommit {
 				e.txnManager.Rollback(txn)
@@ -364,24 +371,28 @@ func (e *Executor) executeUpdate(stmt *UpdateStmt) *Result {
 			return &Result{Error: fmt.Errorf("update failed: %w", err)}
 		}
 
-		newTuple.RowID = uint64(pageID)<<16 | uint64(slotNum)
-
-		// Track in MVCC store
-		e.mvccStore.RestoreTuple(newTuple)
+		newTuple.RowID = uint64(newPageID)<<16 | uint64(newSlotNum)
 
 		// Log to WAL
 		if e.walWriter != nil {
-			e.walWriter.LogUpdate(txn.ID, tableID, t.Tuple.RowID, oldTupleData, newTuple.Serialize())
+			lsn := e.walWriter.LogUpdate(txn.ID, tableID, t.Tuple.RowID, newPageID, newSlotNum, oldTupleData, newTuple.Serialize())
+			// Set page LSN on new page
+			if e.bufferPool != nil {
+				if p, err := e.bufferPool.FetchPage(newPageID); err == nil {
+					p.SetLSN(lsn)
+					e.bufferPool.UnpinPage(newPageID, true)
+				}
+			}
 		}
 
 		updated++
 	}
 
 	if autoCommit {
+		e.txnManager.Commit(txn)
 		if e.bufferPool != nil {
 			e.bufferPool.FlushAllPages()
 		}
-		e.txnManager.Commit(txn)
 	}
 
 	return &Result{Message: fmt.Sprintf("UPDATE %d", updated)}
@@ -437,17 +448,24 @@ func (e *Executor) executeDelete(stmt *DeleteStmt) *Result {
 
 		// Log to WAL
 		if e.walWriter != nil {
-			e.walWriter.LogDelete(txn.ID, tableID, t.Tuple.RowID, oldTupleData)
+			lsn := e.walWriter.LogDelete(txn.ID, tableID, t.Tuple.RowID, t.PageID, t.SlotNum, oldTupleData)
+			// Set page LSN
+			if e.bufferPool != nil {
+				if p, err := e.bufferPool.FetchPage(t.PageID); err == nil {
+					p.SetLSN(lsn)
+					e.bufferPool.UnpinPage(t.PageID, true)
+				}
+			}
 		}
 
 		deleted++
 	}
 
 	if autoCommit {
+		e.txnManager.Commit(txn)
 		if e.bufferPool != nil {
 			e.bufferPool.FlushAllPages()
 		}
-		e.txnManager.Commit(txn)
 	}
 
 	return &Result{Message: fmt.Sprintf("DELETE %d", deleted)}

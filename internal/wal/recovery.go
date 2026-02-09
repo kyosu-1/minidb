@@ -20,7 +20,10 @@ type RecoveryManager struct {
 	// Callback for applying redo/undo
 	redoCallback func(record *LogRecord) error
 	undoCallback func(record *LogRecord) error
-	
+
+	// Callback to get page LSN for redo skip check
+	pageLSNCallback func(types.PageID) types.LSN
+
 	// WAL writer for CLR records during undo
 	walWriter *Writer
 }
@@ -47,6 +50,11 @@ func NewRecoveryManager(walPath string, walWriter *Writer) *RecoveryManager {
 func (rm *RecoveryManager) SetCallbacks(redo, undo func(*LogRecord) error) {
 	rm.redoCallback = redo
 	rm.undoCallback = undo
+}
+
+// SetPageLSNCallback sets the callback to get page LSN for redo skip check.
+func (rm *RecoveryManager) SetPageLSNCallback(cb func(types.PageID) types.LSN) {
+	rm.pageLSNCallback = cb
 }
 
 // Recover performs full ARIES recovery: Analysis -> Redo -> Undo.
@@ -151,9 +159,8 @@ func (rm *RecoveryManager) analysisPhase() (types.LSN, error) {
 				entry.LastLSN = record.LSN
 			}
 			// Add to dirty page table
-			pageID := rm.getPageID(record.TableID, record.RowID)
-			if _, exists := rm.dirtyPageTable[pageID]; !exists {
-				rm.dirtyPageTable[pageID] = record.LSN // RecLSN
+			if _, exists := rm.dirtyPageTable[record.PageID]; !exists {
+				rm.dirtyPageTable[record.PageID] = record.LSN // RecLSN
 			}
 			
 		case types.LogRecordCLR:
@@ -210,19 +217,25 @@ func (rm *RecoveryManager) redoPhase() error {
 			continue
 		}
 		
-		pageID := rm.getPageID(record.TableID, record.RowID)
-		
 		// Check if page is in DPT
-		recLSN, inDPT := rm.dirtyPageTable[pageID]
+		recLSN, inDPT := rm.dirtyPageTable[record.PageID]
 		if !inDPT {
 			continue
 		}
-		
+
 		// Check if record LSN < RecLSN
 		if record.LSN < recLSN {
 			continue
 		}
-		
+
+		// Check pageLSN: skip if page already has this change
+		if rm.pageLSNCallback != nil {
+			pageLSN := rm.pageLSNCallback(record.PageID)
+			if pageLSN >= record.LSN {
+				continue
+			}
+		}
+
 		// Apply redo
 		if rm.redoCallback != nil {
 			fmt.Printf("REDO: %s\n", record.String())
@@ -318,6 +331,8 @@ func (rm *RecoveryManager) undoPhase() error {
 				record.TxnID,
 				record.TableID,
 				record.RowID,
+				record.PageID,
+				record.SlotNum,
 				record.PrevLSN,
 				record.BeforeImage,
 			)
@@ -371,14 +386,6 @@ func (rm *RecoveryManager) readAllRecords(file *os.File) ([]*LogRecord, error) {
 	}
 	
 	return records, nil
-}
-
-// getPageID calculates a page ID from table and row ID.
-// In a real implementation, this would depend on the storage layout.
-func (rm *RecoveryManager) getPageID(tableID uint32, rowID uint64) types.PageID {
-	// Simple scheme: combine table and row into a page ID
-	// Real DBs would have proper page management
-	return types.PageID((uint64(tableID) << 32) | (rowID / 100))
 }
 
 // GetActiveTxnTable returns the active transaction table after analysis.

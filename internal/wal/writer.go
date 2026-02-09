@@ -27,6 +27,9 @@ type Writer struct {
 	
 	// Transaction tracking for PrevLSN
 	txnLastLSN map[types.TxnID]types.LSN
+
+	// Max TxnID seen in WAL (for recovery)
+	maxTxnID types.TxnID
 }
 
 const (
@@ -152,7 +155,12 @@ func (w *Writer) findLastLSN() error {
 		}
 		
 		lastLSN = record.LSN
-		
+
+		// Track max TxnID
+		if record.TxnID > w.maxTxnID {
+			w.maxTxnID = record.TxnID
+		}
+
 		// Track transaction's last LSN
 		if record.Type != types.LogRecordCheckpoint {
 			w.txnLastLSN[record.TxnID] = record.LSN
@@ -300,35 +308,41 @@ func (w *Writer) LogAbort(txnID types.TxnID) types.LSN {
 }
 
 // LogUpdate logs an update operation.
-func (w *Writer) LogUpdate(txnID types.TxnID, tableID uint32, rowID uint64, before, after []byte) types.LSN {
+func (w *Writer) LogUpdate(txnID types.TxnID, tableID uint32, rowID uint64, pageID types.PageID, slotNum uint16, before, after []byte) types.LSN {
 	return w.Append(&LogRecord{
 		TxnID:       txnID,
 		Type:        types.LogRecordUpdate,
 		TableID:     tableID,
 		RowID:       rowID,
+		PageID:      pageID,
+		SlotNum:     slotNum,
 		BeforeImage: before,
 		AfterImage:  after,
 	})
 }
 
 // LogInsert logs an insert operation.
-func (w *Writer) LogInsert(txnID types.TxnID, tableID uint32, rowID uint64, data []byte) types.LSN {
+func (w *Writer) LogInsert(txnID types.TxnID, tableID uint32, rowID uint64, pageID types.PageID, slotNum uint16, data []byte) types.LSN {
 	return w.Append(&LogRecord{
 		TxnID:      txnID,
 		Type:       types.LogRecordInsert,
 		TableID:    tableID,
 		RowID:      rowID,
+		PageID:     pageID,
+		SlotNum:    slotNum,
 		AfterImage: data,
 	})
 }
 
 // LogDelete logs a delete operation.
-func (w *Writer) LogDelete(txnID types.TxnID, tableID uint32, rowID uint64, data []byte) types.LSN {
+func (w *Writer) LogDelete(txnID types.TxnID, tableID uint32, rowID uint64, pageID types.PageID, slotNum uint16, data []byte) types.LSN {
 	return w.Append(&LogRecord{
 		TxnID:       txnID,
 		Type:        types.LogRecordDelete,
 		TableID:     tableID,
 		RowID:       rowID,
+		PageID:      pageID,
+		SlotNum:     slotNum,
 		BeforeImage: data,
 	})
 }
@@ -346,12 +360,14 @@ func (w *Writer) LogCheckpoint(activeTxns []types.TxnID, dirtyPages map[types.Pa
 }
 
 // LogCLR logs a compensation log record during UNDO.
-func (w *Writer) LogCLR(txnID types.TxnID, tableID uint32, rowID uint64, undoNextLSN types.LSN, data []byte) types.LSN {
+func (w *Writer) LogCLR(txnID types.TxnID, tableID uint32, rowID uint64, pageID types.PageID, slotNum uint16, undoNextLSN types.LSN, data []byte) types.LSN {
 	return w.Append(&LogRecord{
 		TxnID:       txnID,
 		Type:        types.LogRecordCLR,
 		TableID:     tableID,
 		RowID:       rowID,
+		PageID:      pageID,
+		SlotNum:     slotNum,
 		AfterImage:  data,
 		UndoNextLSN: undoNextLSN,
 	})
@@ -388,4 +404,11 @@ func (w *Writer) GetTxnLastLSN(txnID types.TxnID) types.LSN {
 	w.mu.Lock()
 	defer w.mu.Unlock()
 	return w.txnLastLSN[txnID]
+}
+
+// GetMaxTxnID returns the maximum TxnID seen in the WAL.
+func (w *Writer) GetMaxTxnID() types.TxnID {
+	w.mu.Lock()
+	defer w.mu.Unlock()
+	return w.maxTxnID
 }

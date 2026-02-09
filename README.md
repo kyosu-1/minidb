@@ -168,9 +168,11 @@ minidb> stats
 
 ```
 ┌────────────────────────────────────────┐
-│ Header (24 bytes)                      │
-│   PageID | Type | LSN | SlotCount |    │
-│   FreeSpaceOffset | FreeSpaceEnd       │
+│ Header (28 bytes)                      │
+│   PageID(4) | Type(1) | Reserved(3)   │
+│   LSN(8) | SlotCount(2)               │
+│   FreeSpaceOffset(2) | FreeSpaceEnd(2)│
+│   NextPageID(4) | Reserved(2)         │
 ├────────────────────────────────────────┤
 │                                        │
 │           Free Space                   │
@@ -182,6 +184,8 @@ minidb> stats
 │   [offset|len] [offset|len] ...        │
 └────────────────────────────────────────┘
 ```
+
+ヒープページは `NextPageID` フィールドによりリンクリストで連結されます（連続ページ番号を仮定しません）。
 
 ### 2. バッファプール (`storage/buffer.go`)
 

@@ -21,7 +21,7 @@ type CommandID uint32
 // Constants
 const (
 	PageSize       = 4096
-	InvalidPageID  = PageID(0)
+	InvalidPageID  = PageID(0xFFFFFFFF)
 	InvalidTxnID   = TxnID(0)
 	InvalidLSN     = LSN(0)
 	MaxTxnID       = TxnID(^uint64(0))

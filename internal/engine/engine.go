@@ -185,6 +185,17 @@ func (e *Engine) recover() error {
 		},
 	)
 
+	// Set pageLSN callback for redo skip check
+	rm.SetPageLSNCallback(func(pageID types.PageID) types.LSN {
+		page, err := e.bufferPool.FetchPage(pageID)
+		if err != nil {
+			return types.InvalidLSN
+		}
+		lsn := page.GetLSN()
+		e.bufferPool.UnpinPage(pageID, false)
+		return lsn
+	})
+
 	if err := rm.Recover(); err != nil {
 		return err
 	}
@@ -194,35 +205,71 @@ func (e *Engine) recover() error {
 		return fmt.Errorf("failed to flush pages after recovery: %w", err)
 	}
 
-	// Update transaction manager's next ID
+	// Update transaction manager's next ID using max from WAL
+	maxTxnID := e.walWriter.GetMaxTxnID()
 	att := rm.GetActiveTxnTable()
-	maxTxnID := types.TxnID(0)
 	for txnID := range att {
 		if txnID > maxTxnID {
 			maxTxnID = txnID
 		}
 	}
-	e.txnManager.SetNextTxnID(maxTxnID + 1)
+	if maxTxnID > 0 {
+		e.txnManager.SetNextTxnID(maxTxnID + 1)
+	}
 
 	return nil
 }
 
 func (e *Engine) applyRedo(record *wal.LogRecord) error {
 	switch record.Type {
-	case types.LogRecordInsert, types.LogRecordUpdate:
-		tuple, err := types.DeserializeTuple(record.AfterImage)
+	case types.LogRecordInsert:
+		// Redo insert: write tuple to page
+		page, err := e.bufferPool.FetchPage(record.PageID)
 		if err != nil {
 			return err
 		}
-		e.mvccStore.RestoreTuple(tuple)
+		page.UpdateTuple(record.SlotNum, record.AfterImage)
+		page.SetLSN(record.LSN)
+		e.bufferPool.UnpinPage(record.PageID, true)
+
+	case types.LogRecordUpdate:
+		// Redo update: write new tuple to its page
+		page, err := e.bufferPool.FetchPage(record.PageID)
+		if err != nil {
+			return err
+		}
+		page.UpdateTuple(record.SlotNum, record.AfterImage)
+		page.SetLSN(record.LSN)
+		e.bufferPool.UnpinPage(record.PageID, true)
 
 	case types.LogRecordDelete:
-		tuple, err := types.DeserializeTuple(record.BeforeImage)
+		// Redo delete: set XMax on tuple
+		page, err := e.bufferPool.FetchPage(record.PageID)
 		if err != nil {
 			return err
 		}
-		tuple.XMax = record.TxnID
-		e.mvccStore.RestoreTuple(tuple)
+		tupleData, err := page.GetTuple(record.SlotNum)
+		if err == nil {
+			tuple, err := types.DeserializeTuple(tupleData)
+			if err == nil {
+				tuple.XMax = record.TxnID
+				page.UpdateTuple(record.SlotNum, tuple.Serialize())
+			}
+		}
+		page.SetLSN(record.LSN)
+		e.bufferPool.UnpinPage(record.PageID, true)
+
+	case types.LogRecordCLR:
+		// Redo CLR: apply the compensation
+		page, err := e.bufferPool.FetchPage(record.PageID)
+		if err != nil {
+			return err
+		}
+		if record.AfterImage != nil {
+			page.UpdateTuple(record.SlotNum, record.AfterImage)
+		}
+		page.SetLSN(record.LSN)
+		e.bufferPool.UnpinPage(record.PageID, true)
 	}
 
 	return nil
@@ -231,15 +278,40 @@ func (e *Engine) applyRedo(record *wal.LogRecord) error {
 func (e *Engine) applyUndo(record *wal.LogRecord) error {
 	switch record.Type {
 	case types.LogRecordInsert:
-		e.mvccStore.RollbackTransaction(record.TxnID)
-
-	case types.LogRecordUpdate, types.LogRecordDelete:
-		oldTuple, err := types.DeserializeTuple(record.BeforeImage)
+		// Undo insert: delete tuple from page
+		page, err := e.bufferPool.FetchPage(record.PageID)
 		if err != nil {
 			return err
 		}
-		oldTuple.XMax = types.InvalidTxnID
-		e.mvccStore.RestoreTuple(oldTuple)
+		page.DeleteTuple(record.SlotNum)
+		e.bufferPool.UnpinPage(record.PageID, true)
+
+	case types.LogRecordUpdate:
+		// Undo update: restore old tuple
+		if record.BeforeImage != nil {
+			page, err := e.bufferPool.FetchPage(record.PageID)
+			if err != nil {
+				return err
+			}
+			page.UpdateTuple(record.SlotNum, record.BeforeImage)
+			e.bufferPool.UnpinPage(record.PageID, true)
+		}
+
+	case types.LogRecordDelete:
+		// Undo delete: clear XMax
+		page, err := e.bufferPool.FetchPage(record.PageID)
+		if err != nil {
+			return err
+		}
+		tupleData, err := page.GetTuple(record.SlotNum)
+		if err == nil {
+			tuple, err := types.DeserializeTuple(tupleData)
+			if err == nil {
+				tuple.XMax = types.InvalidTxnID
+				page.UpdateTuple(record.SlotNum, tuple.Serialize())
+			}
+		}
+		e.bufferPool.UnpinPage(record.PageID, true)
 	}
 
 	return nil
@@ -300,15 +372,21 @@ func (e *Engine) CreateIndex(tableName string) error {
 
 // Checkpoint creates a checkpoint.
 func (e *Engine) Checkpoint() error {
-	// Flush all dirty pages
+	// Get dirty pages BEFORE flushing
+	dirtyPages := e.bufferPool.GetDirtyPages()
+	activeTxns := e.txnManager.GetActiveTxns()
+
+	// Flush WAL first
+	if err := e.walWriter.Flush(); err != nil {
+		return err
+	}
+
+	// Then flush dirty pages
 	if err := e.bufferPool.FlushAllPages(); err != nil {
 		return err
 	}
 
-	// Get dirty pages for checkpoint record
-	dirtyPages := e.bufferPool.GetDirtyPages()
-	activeTxns := e.txnManager.GetActiveTxns()
-
+	// Write checkpoint record
 	_, err := e.walWriter.LogCheckpoint(activeTxns, dirtyPages)
 	return err
 }

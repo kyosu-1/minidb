@@ -9,7 +9,7 @@ import (
 
 const (
 	PageSize       = 4096
-	PageHeaderSize = 24
+	PageHeaderSize = 28
 
 	// Page types
 	PageTypeData    = 1
@@ -38,14 +38,15 @@ var (
 //
 // Header format:
 //   PageID (4) + PageType (1) + Reserved (3) + LSN (8) +
-//   SlotCount (2) + FreeSpaceOffset (2) + FreeSpaceEnd (2) + Reserved (2)
+//   SlotCount (2) + FreeSpaceOffset (2) + FreeSpaceEnd (2) + NextPageID (4) + Reserved (2)
 type Page struct {
-	ID       types.PageID
-	Type     uint8
-	LSN      types.LSN
-	IsDirty  bool
-	PinCount int
-	Data     [PageSize]byte
+	ID         types.PageID
+	Type       uint8
+	LSN        types.LSN
+	NextPageID types.PageID
+	IsDirty    bool
+	PinCount   int
+	Data       [PageSize]byte
 }
 
 // NewPage creates a new empty page.
@@ -77,6 +78,10 @@ func (p *Page) init() {
 
 	// Free space ends at page end (slot array grows backwards)
 	binary.LittleEndian.PutUint16(p.Data[20:22], PageSize)
+
+	// NextPageID = InvalidPageID
+	p.NextPageID = types.InvalidPageID
+	binary.LittleEndian.PutUint32(p.Data[22:26], uint32(types.InvalidPageID))
 }
 
 // Header accessors
@@ -111,6 +116,16 @@ func (p *Page) SetLSN(lsn types.LSN) {
 
 func (p *Page) GetLSN() types.LSN {
 	return types.LSN(binary.LittleEndian.Uint64(p.Data[8:16]))
+}
+
+func (p *Page) GetNextPageID() types.PageID {
+	return types.PageID(binary.LittleEndian.Uint32(p.Data[22:26]))
+}
+
+func (p *Page) SetNextPageID(nextID types.PageID) {
+	p.NextPageID = nextID
+	binary.LittleEndian.PutUint32(p.Data[22:26], uint32(nextID))
+	p.IsDirty = true
 }
 
 // Slot format: Offset (2 bytes) + Length (2 bytes)
@@ -273,4 +288,5 @@ func (p *Page) Deserialize(data []byte) {
 	p.ID = types.PageID(binary.LittleEndian.Uint32(p.Data[0:4]))
 	p.Type = p.Data[4]
 	p.LSN = types.LSN(binary.LittleEndian.Uint64(p.Data[8:16]))
+	p.NextPageID = types.PageID(binary.LittleEndian.Uint32(p.Data[22:26]))
 }

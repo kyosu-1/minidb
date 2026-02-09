@@ -74,13 +74,13 @@ func NewBTree(bufferPool *storage.BufferPool, keySize int) (*BTree, error) {
 	}
 	
 	// Calculate order
-	usableSpace := storage.PageSize - btreeHeaderSize
+	usableSpace := storage.PageSize - storage.PageHeaderSize - btreeHeaderSize
 	leafEntrySize := keySize + ridSize
 	bt.order = usableSpace / leafEntrySize
 	if bt.order < 3 {
 		bt.order = 3
 	}
-	
+
 	// Create root page (initially a leaf)
 	rootPage, err := bufferPool.NewPage(storage.PageTypeBTree)
 	if err != nil {
@@ -108,13 +108,13 @@ func LoadBTree(bufferPool *storage.BufferPool, rootPageID types.PageID, keySize 
 		keySize:    keySize,
 	}
 	
-	usableSpace := storage.PageSize - btreeHeaderSize
+	usableSpace := storage.PageSize - storage.PageHeaderSize - btreeHeaderSize
 	leafEntrySize := keySize + ridSize
 	bt.order = usableSpace / leafEntrySize
 	if bt.order < 3 {
 		bt.order = 3
 	}
-	
+
 	return bt
 }
 
@@ -498,11 +498,11 @@ func (bt *BTree) normalizeKey(key []byte) []byte {
 // deserializeNode reads a B-Tree node from a page.
 func (bt *BTree) deserializeNode(page *storage.Page) *BTreeNode {
 	node := &BTreeNode{page: page}
-	
-	node.isLeaf = page.Data[0] == 1
-	node.keyCount = int(binary.LittleEndian.Uint16(page.Data[1:3]))
-	
-	offset := btreeHeaderSize
+
+	node.isLeaf = page.Data[storage.PageHeaderSize] == 1
+	node.keyCount = int(binary.LittleEndian.Uint16(page.Data[storage.PageHeaderSize+1 : storage.PageHeaderSize+3]))
+
+	offset := storage.PageHeaderSize + btreeHeaderSize
 	
 	if node.isLeaf {
 		node.keys = make([][]byte, node.keyCount)
@@ -540,16 +540,16 @@ func (bt *BTree) deserializeNode(page *storage.Page) *BTreeNode {
 // serialize writes a B-Tree node to its page.
 func (node *BTreeNode) serialize() {
 	page := node.page
-	
-	// Header
+
+	// Header (after page header)
 	if node.isLeaf {
-		page.Data[0] = 1
+		page.Data[storage.PageHeaderSize] = 1
 	} else {
-		page.Data[0] = 0
+		page.Data[storage.PageHeaderSize] = 0
 	}
-	binary.LittleEndian.PutUint16(page.Data[1:3], uint16(node.keyCount))
-	
-	offset := btreeHeaderSize
+	binary.LittleEndian.PutUint16(page.Data[storage.PageHeaderSize+1:storage.PageHeaderSize+3], uint16(node.keyCount))
+
+	offset := storage.PageHeaderSize + btreeHeaderSize
 	
 	if node.isLeaf {
 		for i := 0; i < node.keyCount; i++ {
