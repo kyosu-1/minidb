@@ -309,9 +309,16 @@ func (rm *RecoveryManager) undoPhase() error {
 		if record.Type != types.LogRecordUpdate &&
 			record.Type != types.LogRecordInsert &&
 			record.Type != types.LogRecordDelete {
-			// Follow PrevLSN
-			if record.PrevLSN != 0 {
-				toUndo = append(toUndo, record.PrevLSN)
+			if record.Type == types.LogRecordCLR {
+				// CLR: follow UndoNextLSN to skip already-compensated records
+				if record.UndoNextLSN != 0 {
+					toUndo = append(toUndo, record.UndoNextLSN)
+				}
+			} else {
+				// Other non-data records (BEGIN, etc.): follow PrevLSN
+				if record.PrevLSN != 0 {
+					toUndo = append(toUndo, record.PrevLSN)
+				}
 			}
 			continue
 		}

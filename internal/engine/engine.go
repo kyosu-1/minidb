@@ -227,19 +227,46 @@ func (e *Engine) applyRedo(record *wal.LogRecord) error {
 		if err != nil {
 			return err
 		}
-		page.UpdateTuple(record.SlotNum, record.AfterImage)
+		if err := e.redoWriteSlot(page, record.SlotNum, record.AfterImage); err != nil {
+			e.bufferPool.UnpinPage(record.PageID, true)
+			return fmt.Errorf("redo insert: %w", err)
+		}
 		page.SetLSN(record.LSN)
 		e.bufferPool.UnpinPage(record.PageID, true)
 
 	case types.LogRecordUpdate:
-		// Redo update: write new tuple to its page
+		// Redo update step 1: write new version at new location
 		page, err := e.bufferPool.FetchPage(record.PageID)
 		if err != nil {
 			return err
 		}
-		page.UpdateTuple(record.SlotNum, record.AfterImage)
+		if err := e.redoWriteSlot(page, record.SlotNum, record.AfterImage); err != nil {
+			e.bufferPool.UnpinPage(record.PageID, true)
+			return fmt.Errorf("redo update new version: %w", err)
+		}
 		page.SetLSN(record.LSN)
 		e.bufferPool.UnpinPage(record.PageID, true)
+
+		// Redo update step 2: set XMax on old version
+		// Old location is encoded in RowID: PageID<<16 | SlotNum
+		oldPageID := types.PageID(record.RowID >> 16)
+		oldSlotNum := uint16(record.RowID & 0xFFFF)
+		if oldPageID != record.PageID || oldSlotNum != record.SlotNum {
+			oldPage, err := e.bufferPool.FetchPage(oldPageID)
+			if err != nil {
+				return fmt.Errorf("redo update fetch old page: %w", err)
+			}
+			tupleData, err := oldPage.GetTuple(oldSlotNum)
+			if err == nil {
+				tuple, err := types.DeserializeTuple(tupleData)
+				if err == nil && tuple.XMax == types.InvalidTxnID {
+					tuple.XMax = record.TxnID
+					oldPage.UpdateTuple(oldSlotNum, tuple.Serialize())
+				}
+			}
+			oldPage.SetLSN(record.LSN)
+			e.bufferPool.UnpinPage(oldPageID, true)
+		}
 
 	case types.LogRecordDelete:
 		// Redo delete: set XMax on tuple
@@ -248,12 +275,19 @@ func (e *Engine) applyRedo(record *wal.LogRecord) error {
 			return err
 		}
 		tupleData, err := page.GetTuple(record.SlotNum)
-		if err == nil {
-			tuple, err := types.DeserializeTuple(tupleData)
-			if err == nil {
-				tuple.XMax = record.TxnID
-				page.UpdateTuple(record.SlotNum, tuple.Serialize())
-			}
+		if err != nil {
+			e.bufferPool.UnpinPage(record.PageID, true)
+			return fmt.Errorf("redo delete get tuple: %w", err)
+		}
+		tuple, err := types.DeserializeTuple(tupleData)
+		if err != nil {
+			e.bufferPool.UnpinPage(record.PageID, true)
+			return fmt.Errorf("redo delete deserialize: %w", err)
+		}
+		tuple.XMax = record.TxnID
+		if err := page.UpdateTuple(record.SlotNum, tuple.Serialize()); err != nil {
+			e.bufferPool.UnpinPage(record.PageID, true)
+			return fmt.Errorf("redo delete update: %w", err)
 		}
 		page.SetLSN(record.LSN)
 		e.bufferPool.UnpinPage(record.PageID, true)
@@ -265,12 +299,32 @@ func (e *Engine) applyRedo(record *wal.LogRecord) error {
 			return err
 		}
 		if record.AfterImage != nil {
-			page.UpdateTuple(record.SlotNum, record.AfterImage)
+			if err := e.redoWriteSlot(page, record.SlotNum, record.AfterImage); err != nil {
+				e.bufferPool.UnpinPage(record.PageID, true)
+				return fmt.Errorf("redo CLR: %w", err)
+			}
 		}
 		page.SetLSN(record.LSN)
 		e.bufferPool.UnpinPage(record.PageID, true)
 	}
 
+	return nil
+}
+
+// redoWriteSlot writes data to a page slot during redo.
+// If the slot already exists, it updates in place (idempotent redo).
+// If the slot doesn't exist yet (page wasn't flushed before crash), it inserts.
+func (e *Engine) redoWriteSlot(page *storage.Page, slotNum uint16, data []byte) error {
+	if slotNum < page.GetSlotCount() {
+		return page.UpdateTuple(slotNum, data)
+	}
+	newSlot, err := page.InsertTuple(data)
+	if err != nil {
+		return fmt.Errorf("insert failed: %w", err)
+	}
+	if newSlot != slotNum {
+		return fmt.Errorf("slot mismatch: expected %d, got %d", slotNum, newSlot)
+	}
 	return nil
 }
 
@@ -282,19 +336,47 @@ func (e *Engine) applyUndo(record *wal.LogRecord) error {
 		if err != nil {
 			return err
 		}
-		page.DeleteTuple(record.SlotNum)
+		if err := page.DeleteTuple(record.SlotNum); err != nil {
+			e.bufferPool.UnpinPage(record.PageID, true)
+			return fmt.Errorf("undo insert: %w", err)
+		}
 		e.bufferPool.UnpinPage(record.PageID, true)
 
 	case types.LogRecordUpdate:
-		// Undo update: restore old tuple
-		if record.BeforeImage != nil {
-			page, err := e.bufferPool.FetchPage(record.PageID)
-			if err != nil {
-				return err
-			}
-			page.UpdateTuple(record.SlotNum, record.BeforeImage)
-			e.bufferPool.UnpinPage(record.PageID, true)
+		// Undo update step 1: delete new version
+		page, err := e.bufferPool.FetchPage(record.PageID)
+		if err != nil {
+			return err
 		}
+		if err := page.DeleteTuple(record.SlotNum); err != nil {
+			e.bufferPool.UnpinPage(record.PageID, true)
+			return fmt.Errorf("undo update delete new version: %w", err)
+		}
+		e.bufferPool.UnpinPage(record.PageID, true)
+
+		// Undo update step 2: clear XMax on old version
+		oldPageID := types.PageID(record.RowID >> 16)
+		oldSlotNum := uint16(record.RowID & 0xFFFF)
+		oldPage, err := e.bufferPool.FetchPage(oldPageID)
+		if err != nil {
+			return fmt.Errorf("undo update fetch old page: %w", err)
+		}
+		tupleData, err := oldPage.GetTuple(oldSlotNum)
+		if err != nil {
+			e.bufferPool.UnpinPage(oldPageID, true)
+			return fmt.Errorf("undo update get old tuple: %w", err)
+		}
+		tuple, err := types.DeserializeTuple(tupleData)
+		if err != nil {
+			e.bufferPool.UnpinPage(oldPageID, true)
+			return fmt.Errorf("undo update deserialize: %w", err)
+		}
+		tuple.XMax = types.InvalidTxnID
+		if err := oldPage.UpdateTuple(oldSlotNum, tuple.Serialize()); err != nil {
+			e.bufferPool.UnpinPage(oldPageID, true)
+			return fmt.Errorf("undo update restore old tuple: %w", err)
+		}
+		e.bufferPool.UnpinPage(oldPageID, true)
 
 	case types.LogRecordDelete:
 		// Undo delete: clear XMax
@@ -303,12 +385,19 @@ func (e *Engine) applyUndo(record *wal.LogRecord) error {
 			return err
 		}
 		tupleData, err := page.GetTuple(record.SlotNum)
-		if err == nil {
-			tuple, err := types.DeserializeTuple(tupleData)
-			if err == nil {
-				tuple.XMax = types.InvalidTxnID
-				page.UpdateTuple(record.SlotNum, tuple.Serialize())
-			}
+		if err != nil {
+			e.bufferPool.UnpinPage(record.PageID, true)
+			return fmt.Errorf("undo delete get tuple: %w", err)
+		}
+		tuple, err := types.DeserializeTuple(tupleData)
+		if err != nil {
+			e.bufferPool.UnpinPage(record.PageID, true)
+			return fmt.Errorf("undo delete deserialize: %w", err)
+		}
+		tuple.XMax = types.InvalidTxnID
+		if err := page.UpdateTuple(record.SlotNum, tuple.Serialize()); err != nil {
+			e.bufferPool.UnpinPage(record.PageID, true)
+			return fmt.Errorf("undo delete update: %w", err)
 		}
 		e.bufferPool.UnpinPage(record.PageID, true)
 	}
